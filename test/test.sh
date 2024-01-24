@@ -1,6 +1,6 @@
 #!/bin/bash
 
-gcc main.c -o test
+gcc ../main.c -o test
 echo "Running Test Case 1... (basic function test)"
 ./test << EOF
 insert 1 aaa bbb
