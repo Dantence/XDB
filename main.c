@@ -334,16 +334,27 @@ Cursor* table_start(Table* table) {
 
     return cursor;
 }
-
-Cursor* table_end(Table* table) {
+Cursor* table_find(Table* table, uint32_t key) {
     Cursor* cursor = malloc(sizeof(Cursor));
     cursor->table = table;
     cursor->page_num = table->root_page_num;
     void* root_node = get_page(table->pager, table->root_page_num);
     uint32_t num_cells = *leaf_node_num_cells(root_node);
-    cursor->cell_num = num_cells;
-    cursor->end_of_table = true;
-
+    for (uint32_t i = 0; i < num_cells; i++) {
+        uint32_t node_key = *leaf_node_key(root_node, i);
+        // 不允许重复key
+        if(node_key == key){
+            printf("Duplicate keys.\n");
+            exit(EXIT_FAILURE);
+        }
+        if (node_key > key) {
+            cursor->cell_num = i;
+            break;
+        }
+        if(i == num_cells - 1) {
+            cursor->cell_num = num_cells;
+        }
+    }
     return cursor;
 }
 
@@ -432,7 +443,7 @@ ExecuteResult execute_insert(Statement* statement, Table* table) {
         return EXECUTE_TABLE_FULL;
     }
     Row* row_to_insert = &(statement->row_to_insert);
-    Cursor* cursor = table_end(table);
+    Cursor* cursor = table_find(table, row_to_insert->id);
     leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
     free(cursor);
     return EXECUTE_SUCCESS;
