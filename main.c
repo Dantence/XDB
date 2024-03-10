@@ -187,6 +187,16 @@ const uint32_t INTERNAL_NODE_CHILD_SIZE = sizeof(uint32_t);
 const uint32_t INTERNAL_NODE_CELL_SIZE =
         INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
 
+NodeType get_node_type(void* node) {
+    uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
+    return (NodeType)value;
+}
+
+void set_node_type(void* node, NodeType type) {
+    uint8_t value = type;
+    *((uint8_t*)(node + NODE_TYPE_OFFSET)) = value;
+}
+
 uint32_t* leaf_node_num_cells(void* node) {
     return node + LEAF_NODE_NUM_CELLS_OFFSET;
 }
@@ -203,19 +213,69 @@ void* leaf_node_value(void* node, uint32_t cell_num) {
     return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
 }
 
-NodeType get_node_type(void* node) {
-    uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
-    return (NodeType)value;
+// 假设在具有 N 页的数据库中，分配了页码 0 到 N-1。因此，我们始终可以为新页面分配页码 N
+uint32_t get_unused_page_num(Pager* pager) {
+    return pager->num_pages;
 }
 
-void set_node_type(void* node, NodeType type) {
-    uint8_t value = type;
-    *((uint8_t*)(node + NODE_TYPE_OFFSET)) = value;
+uint32_t* internal_node_num_keys(void* node) {
+    return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
+}
+
+uint32_t* internal_node_right_child(void* node) {
+    return node + INTERNAL_NODE_RIGHT_CHILD_OFFSET;
+}
+
+uint32_t* internal_node_cell(void* node, uint32_t cell_num) {
+    return node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE;
+}
+
+uint32_t* internal_node_child(void* node, uint32_t child_num) {
+    uint32_t num_keys = *internal_node_num_keys(node);
+    if (child_num > num_keys) {
+        printf("Tried to access child_num %d > num_keys %d\n", child_num, num_keys);
+        exit(EXIT_FAILURE);
+    } else if (child_num == num_keys) {
+        return internal_node_right_child(node);
+    } else {
+        return internal_node_cell(node, child_num);
+    }
+}
+
+uint32_t* internal_node_key(void* node, uint32_t key_num) {
+    return internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
+}
+
+// 对于内部节点，最大键始终是其右键。对于叶节点，它是最大索引处的键
+uint32_t get_node_max_key(void* node) {
+    switch (get_node_type(node)) {
+        case NODE_INTERNAL:
+            return *internal_node_key(node, *internal_node_num_keys(node) - 1);
+        case NODE_LEAF:
+            return *leaf_node_key(node, *leaf_node_num_cells(node) - 1);
+    }
+}
+
+bool is_node_root(void* node) {
+    uint8_t value = *((uint8_t*)(node + IS_ROOT_OFFSET));
+    return (bool)value;
+}
+
+void set_node_root(void* node, bool is_root) {
+    uint8_t value = is_root;
+    *((uint8_t*)(node + IS_ROOT_OFFSET)) = value;
 }
 
 void initialize_leaf_node(void* node) {
     *leaf_node_num_cells(node) = 0;
+    set_node_root(node, false);
     set_node_type(node, NODE_LEAF);
+}
+
+void initialize_internal_node(void* node) {
+    set_node_type(node, NODE_INTERNAL);
+    set_node_root(node, false);
+    *internal_node_num_keys(node) = 0;
 }
 
 // 序列化
@@ -331,14 +391,43 @@ void print_constants() {
 }
 
 // B+树可视化
-void print_leaf_node(void* node) {
-    uint32_t num_cells = *leaf_node_num_cells(node);
-    printf("leaf (size %d)\n", num_cells);
-    for (uint32_t i = 0; i < num_cells; i++) {
-        uint32_t key = *leaf_node_key(node, i);
-        printf("  - %d : %d\n", i, key);
+void indent(uint32_t level) {
+    for (uint32_t i = 0; i < level; i++) {
+        printf("  ");
     }
 }
+
+void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
+    void* node = get_page(pager, page_num);
+    uint32_t num_keys, child;
+
+    switch (get_node_type(node)) {
+        case (NODE_LEAF):
+            num_keys = *leaf_node_num_cells(node);
+            indent(indentation_level);
+            printf("- leaf (size %d)\n", num_keys);
+            for (uint32_t i = 0; i < num_keys; i++) {
+                indent(indentation_level + 1);
+                printf("- %d\n", *leaf_node_key(node, i));
+            }
+            break;
+        case (NODE_INTERNAL):
+            num_keys = *internal_node_num_keys(node);
+            indent(indentation_level);
+            printf("- internal (size %d)\n", num_keys);
+            for (uint32_t i = 0; i < num_keys; i++) {
+                child = *internal_node_child(node, i);
+                print_tree(pager, child, indentation_level + 1);
+
+                indent(indentation_level + 1);
+                printf("- key %d\n", *internal_node_key(node, i));
+            }
+            child = *internal_node_right_child(node);
+            print_tree(pager, child, indentation_level + 1);
+            break;
+    }
+}
+
 
 // 处理元命令
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
@@ -351,7 +440,7 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
         return META_COMMAND_SUCCESS;
     } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
         printf("Tree:\n");
-        print_leaf_node(get_page(table->pager, 0));
+        print_tree(table->pager, 0, 0);
         return META_COMMAND_SUCCESS;
     } else {
         return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -448,49 +537,6 @@ void cursor_advance(Cursor* cursor) {
     cursor->cell_num += 1;
     if (cursor->cell_num >= (*leaf_node_num_cells(node))) {
         cursor->end_of_table = true;
-    }
-}
-
-// 假设在具有 N 页的数据库中，分配了页码 0 到 N-1。因此，我们始终可以为新页面分配页码 N
-uint32_t get_unused_page_num(Pager* pager) {
-    return pager->num_pages;
-}
-
-uint32_t* internal_node_num_keys(void* node) {
-    return node + INTERNAL_NODE_NUM_KEYS_OFFSET;
-}
-
-uint32_t* internal_node_right_child(void* node) {
-    return node + INTERNAL_NODE_RIGHT_CHILD_OFFSET;
-}
-
-uint32_t* internal_node_cell(void* node, uint32_t cell_num) {
-    return node + INTERNAL_NODE_HEADER_SIZE + cell_num * INTERNAL_NODE_CELL_SIZE;
-}
-
-uint32_t* internal_node_child(void* node, uint32_t child_num) {
-    uint32_t num_keys = *internal_node_num_keys(node);
-    if (child_num > num_keys) {
-        printf("Tried to access child_num %d > num_keys %d\n", child_num, num_keys);
-        exit(EXIT_FAILURE);
-    } else if (child_num == num_keys) {
-        return internal_node_right_child(node);
-    } else {
-        return internal_node_cell(node, child_num);
-    }
-}
-
-uint32_t* internal_node_key(void* node, uint32_t key_num) {
-    return internal_node_cell(node, key_num) + INTERNAL_NODE_CHILD_SIZE;
-}
-
-// 对于内部节点，最大键始终是其右键。对于叶节点，它是最大索引处的键
-uint32_t get_node_max_key(void* node) {
-    switch (get_node_type(node)) {
-        case NODE_INTERNAL:
-            return *internal_node_key(node, *internal_node_num_keys(node) - 1);
-        case NODE_LEAF:
-            return *leaf_node_key(node, *leaf_node_num_cells(node) - 1);
     }
 }
 
@@ -695,6 +741,7 @@ Table* db_open(const char* filename) {
     if (pager->num_pages == 0) {
         void* root_node = get_page(pager, 0);
         initialize_leaf_node(root_node);
+        set_node_root(root_node, true);
     }
     return table;
 }
