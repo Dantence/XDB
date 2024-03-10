@@ -458,29 +458,6 @@ Cursor* table_start(Table* table) {
 
     return cursor;
 }
-//Cursor* table_find(Table* table, uint32_t key) {
-//    Cursor* cursor = malloc(sizeof(Cursor));
-//    cursor->table = table;
-//    cursor->page_num = table->root_page_num;
-//    void* root_node = get_page(table->pager, table->root_page_num);
-//    uint32_t num_cells = *leaf_node_num_cells(root_node);
-//    for (uint32_t i = 0; i < num_cells; i++) {
-//        uint32_t node_key = *leaf_node_key(root_node, i);
-//        // 不允许重复key
-//        if(node_key == key){
-//            printf("Duplicate keys.\n");
-//            exit(EXIT_FAILURE);
-//        }
-//        if (node_key > key) {
-//            cursor->cell_num = i;
-//            break;
-//        }
-//        if(i == num_cells - 1) {
-//            cursor->cell_num = num_cells;
-//        }
-//    }
-//    return cursor;
-//}
 
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
     void* node = get_page(table->pager, page_num);
@@ -745,15 +722,6 @@ Table* db_open(const char* filename) {
     }
     return table;
 }
-
-// 释放表
-//void free_table(Table* table) {
-//    for (int i = 0; table->pages[i]; i++) {
-//        free(table->pages[i]);
-//    }
-//    free(table);
-//}
-
 
 int main(int argc, char* argv[]) {
     // 禁用缓冲区
