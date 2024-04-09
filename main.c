@@ -152,8 +152,12 @@ const uint8_t COMMON_NODE_HEADER_SIZE =
 // 叶节点头布局
 const uint32_t LEAF_NODE_NUM_CELLS_SIZE = sizeof(uint32_t);
 const uint32_t LEAF_NODE_NUM_CELLS_OFFSET = COMMON_NODE_HEADER_SIZE;
-const uint32_t LEAF_NODE_HEADER_SIZE =
-        COMMON_NODE_HEADER_SIZE + LEAF_NODE_NUM_CELLS_SIZE;
+const uint32_t LEAF_NODE_NEXT_LEAF_SIZE = sizeof(uint32_t);
+const uint32_t LEAF_NODE_NEXT_LEAF_OFFSET =
+        LEAF_NODE_NUM_CELLS_OFFSET + LEAF_NODE_NUM_CELLS_SIZE;
+const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE
+                                       + LEAF_NODE_NUM_CELLS_SIZE
+                                       + LEAF_NODE_NEXT_LEAF_SIZE;
 
 // 叶节点内部布局
 const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
@@ -187,6 +191,8 @@ const uint32_t INTERNAL_NODE_CHILD_SIZE = sizeof(uint32_t);
 const uint32_t INTERNAL_NODE_CELL_SIZE =
         INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
 
+
+
 NodeType get_node_type(void* node) {
     uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
     return (NodeType)value;
@@ -211,6 +217,10 @@ uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
 
 void* leaf_node_value(void* node, uint32_t cell_num) {
     return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+}
+
+uint32_t* leaf_node_next_leaf(void* node) {
+    return node + LEAF_NODE_NEXT_LEAF_OFFSET;
 }
 
 // 假设在具有 N 页的数据库中，分配了页码 0 到 N-1。因此，我们始终可以为新页面分配页码 N
@@ -270,6 +280,7 @@ void initialize_leaf_node(void* node) {
     *leaf_node_num_cells(node) = 0;
     set_node_root(node, false);
     set_node_type(node, NODE_LEAF);
+    *leaf_node_next_leaf(node) = 0;
 }
 
 void initialize_internal_node(void* node) {
@@ -547,12 +558,22 @@ void* cursor_value(Cursor* cursor) {
     return leaf_node_value(page, cursor->cell_num);
 }
 
+// 每当我们想将光标移过叶节点的末尾时，
+// 都可以检查叶节点是否有同级节点
 void cursor_advance(Cursor* cursor) {
     uint32_t page_num = cursor->page_num;
     void* node = get_page(cursor->table->pager, page_num);
     cursor->cell_num += 1;
     if (cursor->cell_num >= (*leaf_node_num_cells(node))) {
-        cursor->end_of_table = true;
+        /* Advance to next leaf node */
+        uint32_t next_page_num = *leaf_node_next_leaf(node);
+        if (next_page_num == 0) {
+            /* This was rightmost leaf */
+            cursor->end_of_table = true;
+        } else {
+            cursor->page_num = next_page_num;
+            cursor->cell_num = 0;
+        }
     }
 }
 
@@ -588,6 +609,8 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
     uint32_t new_page_num = get_unused_page_num(cursor->table->pager);
     void* new_node = get_page(cursor->table->pager, new_page_num);
     initialize_leaf_node(new_node);
+    *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
+    *leaf_node_next_leaf(old_node) = new_page_num;
     for (int32_t i = LEAF_NODE_MAX_CELLS; i >= 0; i--) {
         void* destination_node;
         if (i >= LEAF_NODE_LEFT_SPLIT_COUNT) {
@@ -599,7 +622,8 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
         void* destination = leaf_node_cell(destination_node, index_within_node);
 
         if (i == cursor->cell_num) {
-            serialize_row(value, destination);
+            serialize_row(value,leaf_node_value(destination_node, index_within_node));
+            *leaf_node_key(destination_node, index_within_node) = key;
         } else if (i > cursor->cell_num) {
             memcpy(destination, leaf_node_cell(old_node, i - 1), LEAF_NODE_CELL_SIZE);
         } else {
