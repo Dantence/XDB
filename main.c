@@ -120,7 +120,9 @@ void close_input_buffer(InputBuffer* input_buffer) {
 typedef enum {
     EXECUTE_SUCCESS,
     EXECUTE_TABLE_FULL,
-    EXECUTE_DUPLICATE_KEY
+    EXECUTE_DUPLICATE_KEY,
+    EXECUTE_TABLE_NOT_FOUND,
+    EXECUTE_FAILURE
 } ExecuteResult;
 
 // 元命令，以.开头
@@ -150,6 +152,16 @@ typedef struct {
     Pager* pager;
 } Table;
 
+typedef struct {
+    char name[32];  // 表名
+    Table* table;   // 表对应的数据结构
+} TableInfo;
+
+typedef struct {
+    TableInfo tables[100]; // 最多支持100张表
+    int table_count;
+} Database;
+
 // 游标抽象
 typedef struct {
     Table* table;
@@ -162,12 +174,15 @@ typedef struct {
 // SQL语句类型
 typedef enum {
     STATEMENT_INSERT,
-    STATEMENT_SELECT
+    STATEMENT_SELECT,
+    STATEMENT_CREATE_TABLE,
+    STATEMENT_SHOW_TABLES
 } StatementType;
 
 // SQL语句
 typedef struct {
     StatementType type;
+    char table_name[32];  // 表名
     Row row_to_insert;  // only used by insert statement
 } Statement;
 
@@ -529,17 +544,21 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
 
 
 // 处理元命令
-MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
+MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db) {
     if (strcmp(input_buffer->buffer, ".exit") == 0) {
-        db_close(table);
+        for (int i = 0; i < db->table_count; i++) {
+            db_close(db->tables[i].table);
+        }
         exit(EXIT_SUCCESS);
     } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
         printf("Constants:\n");
         print_constants();
         return META_COMMAND_SUCCESS;
     } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
-        printf("Tree:\n");
-        print_tree(table->pager, 0, 0);
+        for (int i = 0; i < db->table_count; i++) {
+            printf("Table: %s\n", db->tables[i].name);
+            print_tree(db->tables[i].table->pager, 0, 0);
+        }
         return META_COMMAND_SUCCESS;
     } else {
         return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -948,57 +967,68 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
     return PREPARE_SUCCESS;
 }
 
-
-PrepareResult prepare_statement(InputBuffer* input_buffer,
-                                Statement* statement) {
+PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
     if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-        return prepare_insert(input_buffer, statement);
+        statement->type = STATEMENT_INSERT;
+        char* keyword = strtok(input_buffer->buffer, " ");
+        char* table_name = strtok(NULL, " ");
+        char* id_string = strtok(NULL, " ");
+        char* username = strtok(NULL, " ");
+        char* email = strtok(NULL, " ");
+
+        if (table_name == NULL || id_string == NULL || username == NULL || email == NULL) {
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        int id = atoi(id_string);
+        if (id < 0) {
+            return PREPARE_NEGATIVE_ID;
+        }
+        if (strlen(username) > COLUMN_USERNAME_SIZE || strlen(email) > COLUMN_EMAIL_SIZE) {
+            return PREPARE_STRING_TOO_LONG;
+        }
+
+        statement->row_to_insert.id = id;
+        strcpy(statement->row_to_insert.username, username);
+        strcpy(statement->row_to_insert.email, email);
+        strcpy(statement->table_name, table_name);
+
+        return PREPARE_SUCCESS;
     }
-    if (strcmp(input_buffer->buffer, "select") == 0) {
+
+    if (strncmp(input_buffer->buffer, "select", 6) == 0) {
         statement->type = STATEMENT_SELECT;
+        char* keyword = strtok(input_buffer->buffer, " ");
+        char* table_name = strtok(NULL, " ");
+
+        if (table_name == NULL) {
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        strcpy(statement->table_name, table_name);
+        return PREPARE_SUCCESS;
+    }
+
+    if (strncmp(input_buffer->buffer, "create table", 12) == 0) {
+        statement->type = STATEMENT_CREATE_TABLE;
+        char* keyword1 = strtok(input_buffer->buffer, " ");
+        char* keyword2 = strtok(NULL, " ");
+        char* table_name = strtok(NULL, " ");
+
+        if (table_name == NULL) {
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        strcpy(statement->table_name, table_name);
+        return PREPARE_SUCCESS;
+    }
+
+    if (strcmp(input_buffer->buffer, "show tables") == 0) {
+        statement->type = STATEMENT_SHOW_TABLES;
         return PREPARE_SUCCESS;
     }
 
     return PREPARE_UNRECOGNIZED_STATEMENT;
-}
-
-// SQL 执行器
-ExecuteResult execute_insert(Statement* statement, Table* table) {
-    void* node = get_page(table->pager, table->root_page_num);
-    uint32_t num_cells = (*leaf_node_num_cells(node));
-    Row* row_to_insert = &(statement->row_to_insert);
-    uint32_t key_to_insert = row_to_insert->id;
-    Cursor* cursor = table_find(table, key_to_insert);
-    if (cursor->cell_num < num_cells) {
-        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
-        if (key_at_index == key_to_insert) {
-            return EXECUTE_DUPLICATE_KEY;
-        }
-    }
-    leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
-    free(cursor);
-    return EXECUTE_SUCCESS;
-}
-
-ExecuteResult execute_select(Statement* statement, Table* table) {
-    Cursor* cursor = table_start(table);
-    Row row;
-    while (!(cursor->end_of_table)) {
-        deserialize_row(cursor_value(cursor), &row);
-        print_row(&row);
-        cursor_advance(cursor);
-    }
-    free(cursor);
-    return EXECUTE_SUCCESS;
-}
-
-ExecuteResult execute_statement(Statement* statement, Table* table) {
-    switch (statement->type) {
-        case (STATEMENT_INSERT):
-            return execute_insert(statement, table);
-        case (STATEMENT_SELECT):
-            return execute_select(statement, table);
-    }
 }
 
 // 打开数据库文件并跟踪其大小，页面缓存初始化为NULL
@@ -1046,6 +1076,97 @@ Table* db_open(const char* filename) {
     }
     return table;
 }
+ExecuteResult execute_create_table(Statement* statement, Database* db) {
+    if (db->table_count >= 100) {
+        return EXECUTE_TABLE_FULL;
+    }
+
+    Table* table = db_open(statement->table_name);
+    if (!table) {
+        return EXECUTE_FAILURE;
+    }
+
+    strcpy(db->tables[db->table_count].name, statement->table_name);
+    db->tables[db->table_count].table = table;
+    db->table_count++;
+
+    return EXECUTE_SUCCESS;
+}
+
+ExecuteResult execute_show_tables(Database* db) {
+    for (int i = 0; i < db->table_count; i++) {
+        printf("%s\n", db->tables[i].name);
+        append_to_output_buffer("%s\n", db->tables[i].name);
+    }
+    return EXECUTE_SUCCESS;
+}
+
+Table* find_table(Database* db, const char* table_name) {
+    for (int i = 0; i < db->table_count; i++) {
+        if (strcmp(db->tables[i].name, table_name) == 0) {
+            return db->tables[i].table;
+        }
+    }
+    return NULL;
+}
+
+ExecuteResult execute_insert(Statement* statement, Database* db) {
+    Table* table = find_table(db, statement->table_name);
+    if (!table) {
+        return EXECUTE_TABLE_NOT_FOUND;
+    }
+
+    void* node = get_page(table->pager, table->root_page_num);
+    uint32_t num_cells = (*leaf_node_num_cells(node));
+    Row* row_to_insert = &(statement->row_to_insert);
+    uint32_t key_to_insert = row_to_insert->id;
+    Cursor* cursor = table_find(table, key_to_insert);
+    if (cursor->cell_num < num_cells) {
+        uint32_t key_at_index = *leaf_node_key(node, cursor->cell_num);
+        if (key_at_index == key_to_insert) {
+            return EXECUTE_DUPLICATE_KEY;
+        }
+    }
+    leaf_node_insert(cursor, row_to_insert->id, row_to_insert);
+    free(cursor);
+    return EXECUTE_SUCCESS;
+}
+
+ExecuteResult execute_select(Statement* statement, Database* db) {
+    Table* table = find_table(db, statement->table_name);
+    if (!table) {
+        return EXECUTE_TABLE_NOT_FOUND;
+    }
+
+    Cursor* cursor = table_start(table);
+    Row row;
+    while (!(cursor->end_of_table)) {
+        deserialize_row(cursor_value(cursor), &row);
+        print_row(&row);
+        cursor_advance(cursor);
+    }
+    free(cursor);
+    return EXECUTE_SUCCESS;
+}
+
+ExecuteResult execute_statement(Statement* statement, Database* db) {
+    switch (statement->type) {
+        case (STATEMENT_INSERT):
+            return execute_insert(statement, db);
+        case (STATEMENT_SELECT):
+            return execute_select(statement, db);
+        case (STATEMENT_CREATE_TABLE):
+            return execute_create_table(statement, db);
+        case (STATEMENT_SHOW_TABLES):
+            return execute_show_tables(db);
+        default:
+            return EXECUTE_FAILURE;
+    }
+}
+
+
+
+
 
 gboolean on_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget));
@@ -1059,10 +1180,10 @@ gboolean on_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data
 }
 
 void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
-    // 从data中获取text_view、table和input_buffer
+    // 从data中获取text_view、database和input_buffer
     GtkWidget **widgets = (GtkWidget **)data;
     GtkWidget *text_view = widgets[0];
-    Table *table = (Table *)widgets[1];
+    Database *db = (Database *)widgets[1];
     InputBuffer *input_buffer = (InputBuffer *)widgets[2];
     GtkWidget *output_text_view = widgets[3];
 
@@ -1089,7 +1210,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
 
     if (input_buffer->buffer[0] == '.') {
-        switch (do_meta_command(input_buffer, table)) {
+        switch (do_meta_command(input_buffer, db)) {
             case (META_COMMAND_SUCCESS):
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Meta-command executed successfully.\n", -1);
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
@@ -1123,7 +1244,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             return;
     }
 
-    switch (execute_statement(&statement, table)) {
+    switch (execute_statement(&statement, db)) {
         case (EXECUTE_SUCCESS):
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Executed.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
@@ -1136,30 +1257,24 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Duplicate key.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
             break;
+        case (EXECUTE_TABLE_NOT_FOUND):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Table not found.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            break;
     }
 }
 
+
 int main(int argc, char *argv[]) {
-    if(argc < 2) {
+    if (argc < 2) {
         printf("Must supply a database filename.\n");
         exit(EXIT_FAILURE);
     }
     char* filename = argv[1];
-    Table* table = db_open(filename);
-
-    // Debug information to check table pointer
-    if (!table) {
-        printf("Failed to open database.\n");
-        exit(EXIT_FAILURE);
-    }
+    Database db;
+    db.table_count = 0;
 
     InputBuffer* input_buffer = new_input_buffer();
-
-    // Debug information to check input_buffer initialization
-    if (!input_buffer || !input_buffer->buffer) {
-        printf("Failed to allocate input buffer.\n");
-        exit(EXIT_FAILURE);
-    }
 
     GtkWidget *window;
     GtkWidget *vbox;
@@ -1210,7 +1325,7 @@ int main(int argc, char *argv[]) {
 
     // 存储text_view、table和input_buffer
     widgets[0] = text_view;
-    widgets[1] = (GtkWidget *)table;
+    widgets[1] = (GtkWidget *)&db;
     widgets[2] = (GtkWidget *)input_buffer;
     widgets[3] = output_text_view;
 
@@ -1223,3 +1338,4 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
+
