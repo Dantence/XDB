@@ -1,17 +1,30 @@
-#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
+#include <stdbool.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <errno.h>
+#include <sys/stat.h>
+#include <io.h>
+#include <gtk/gtk.h>
+#include <stdarg.h>
+#include <pango/pango.h>
 
 #define COLUMN_USERNAME_SIZE 32
 #define COLUMN_EMAIL_SIZE 255
 #define TABLE_MAX_PAGES 100
 #define INVALID_PAGE_NUM UINT32_MAX
 
+#define OUTPUT_BUFFER_SIZE 8192
+char output_buffer[OUTPUT_BUFFER_SIZE];
+size_t output_buffer_pos = 0;
+
+void append_to_output_buffer(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    output_buffer_pos += vsnprintf(output_buffer + output_buffer_pos, OUTPUT_BUFFER_SIZE - output_buffer_pos, format, args);
+    va_end(args);
+}
 
 // 行属性
 typedef struct {
@@ -20,6 +33,7 @@ typedef struct {
     char email[COLUMN_EMAIL_SIZE + 1];
 } Row;
 
+#define INPUT_BUFFER_SIZE 1024
 // 输入信息
 typedef struct {
     char* buffer;
@@ -29,14 +43,58 @@ typedef struct {
 
 // 创建输入信息
 InputBuffer* new_input_buffer() {
-    InputBuffer* input_buffer = malloc(sizeof(InputBuffer));
-    input_buffer->buffer = NULL;
-    input_buffer->buffer_length = 0;
+    InputBuffer* input_buffer = (InputBuffer*)malloc(sizeof(InputBuffer));
+    if (!input_buffer) {
+        perror("Unable to allocate input buffer");
+        exit(EXIT_FAILURE);
+    }
+    input_buffer->buffer = (char*)malloc(INPUT_BUFFER_SIZE);
+    if (!input_buffer->buffer) {
+        perror("Unable to allocate input buffer");
+        free(input_buffer);
+        exit(EXIT_FAILURE);
+    }
+    input_buffer->buffer_length = INPUT_BUFFER_SIZE;
     input_buffer->input_length = 0;
-
     return input_buffer;
 }
 
+// 自定义 getline 实现
+ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+    if (*lineptr == NULL || *n == 0) {
+        *n = 128; // 初始缓冲区大小
+        *lineptr = (char*)malloc(*n);
+        if (*lineptr == NULL) {
+            return -1; // 分配失败
+        }
+    }
+
+    char *buffer = *lineptr;
+    int ch;
+    size_t i = 0;
+
+    while ((ch = fgetc(stream)) != EOF) {
+        if (i >= *n - 1) { // 扩展缓冲区
+            *n *= 2;
+            buffer = (char*)realloc(buffer, *n);
+            if (buffer == NULL) {
+                return -1; // 分配失败
+            }
+            *lineptr = buffer;
+        }
+        buffer[i++] = ch;
+        if (ch == '\n') {
+            break;
+        }
+    }
+
+    if (ch == EOF && i == 0) {
+        return -1; // EOF 并且没有读取到任何字符
+    }
+
+    buffer[i] = '\0';
+    return i;
+}
 // 读取输入
 void read_input(InputBuffer* input_buffer) {
     ssize_t bytes_read =
@@ -115,11 +173,13 @@ typedef struct {
 
 // 打印行
 void print_row(Row* row) {
+    append_to_output_buffer("(%d, %s, %s)\n", row->id, row->username, row->email);
     printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
 
 // 打印提示符
 void print_prompt() {
+    append_to_output_buffer("db > ");
     printf("db > ");
 }
 
@@ -942,12 +1002,12 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
 }
 
 // 打开数据库文件并跟踪其大小，页面缓存初始化为NULL
-Pager *pager_open(const char *filename) {
-    int fd = open(filename,
-                  O_RDWR |      // Read/Write mode
-                  O_CREAT,  // Create file if it does not exist
-                  S_IWUSR |     // User write permission
-                  S_IRUSR   // User read permission
+Pager* pager_open(const char* filename) {
+    int fd = _open(filename,
+                  _O_RDWR |     // 读/写模式
+                  _O_CREAT,     // 如果文件不存在则创建
+                  _S_IWRITE |   // 用户写权限
+                  _S_IREAD      // 用户读权限
     );
 
     if (fd == -1) {
@@ -955,9 +1015,10 @@ Pager *pager_open(const char *filename) {
         exit(EXIT_FAILURE);
     }
 
-    off_t file_length = lseek(fd, 0, SEEK_END);
+    // 获取文件长度
+    off_t file_length = _lseek(fd, 0, SEEK_END);
 
-    Pager *pager = malloc(sizeof(Pager));
+    Pager* pager = malloc(sizeof(Pager));
     pager->file_descriptor = fd;
     pager->file_length = file_length;
     pager->num_pages = (file_length / PAGE_SIZE);
@@ -969,7 +1030,6 @@ Pager *pager_open(const char *filename) {
     for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
         pager->pages[i] = NULL;
     }
-
     return pager;
 }
 
@@ -987,9 +1047,99 @@ Table* db_open(const char* filename) {
     return table;
 }
 
-int main(int argc, char* argv[]) {
-    // 禁用缓冲区
-    setbuf(stdout, NULL);
+gboolean on_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget));
+    if (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter) {
+        GtkTextIter iter;
+        gtk_text_buffer_get_end_iter(buffer, &iter);
+        gtk_text_buffer_insert(buffer, &iter, "\n", -1);
+        return TRUE; // 阻止默认行为
+    }
+    return FALSE; // 允许其他按键的默认行为
+}
+
+void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
+    // 从data中获取text_view、table和input_buffer
+    GtkWidget **widgets = (GtkWidget **)data;
+    GtkWidget *text_view = widgets[0];
+    Table *table = (Table *)widgets[1];
+    InputBuffer *input_buffer = (InputBuffer *)widgets[2];
+    GtkWidget *output_text_view = widgets[3];
+
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
+    GtkTextIter start, end;
+    gtk_text_buffer_get_start_iter(buffer, &start);
+    gtk_text_buffer_get_end_iter(buffer, &end);
+
+    gchar *input_text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+
+    strncpy(input_buffer->buffer, input_text, input_buffer->buffer_length - 1); // 避免缓冲区溢出
+    input_buffer->buffer[input_buffer->buffer_length - 1] = '\0'; // 确保字符串以null结尾
+    input_buffer->input_length = strlen(input_text);
+
+    g_free(input_text); // 释放临时分配的内存
+
+    // 清空输出缓冲区
+    memset(output_buffer, 0, OUTPUT_BUFFER_SIZE);
+    output_buffer_pos = 0;
+
+    // 处理输入
+    GtkTextBuffer *output_buffer_widget = gtk_text_view_get_buffer(GTK_TEXT_VIEW(output_text_view));
+    GtkTextIter output_iter;
+    gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
+
+    if (input_buffer->buffer[0] == '.') {
+        switch (do_meta_command(input_buffer, table)) {
+            case (META_COMMAND_SUCCESS):
+                gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Meta-command executed successfully.\n", -1);
+                gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+                return;
+            case (META_COMMAND_UNRECOGNIZED_COMMAND):
+                gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Unrecognized command.\n", -1);
+                gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+                return;
+        }
+    }
+
+    Statement statement;
+    switch (prepare_statement(input_buffer, &statement)) {
+        case (PREPARE_SUCCESS):
+            break;
+        case (PREPARE_NEGATIVE_ID):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "ID must be positive.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            return;
+        case (PREPARE_STRING_TOO_LONG):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "String is too long.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            return;
+        case (PREPARE_SYNTAX_ERROR):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Syntax error. Could not parse statement.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            return;
+        case (PREPARE_UNRECOGNIZED_STATEMENT):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Unrecognized keyword.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            return;
+    }
+
+    switch (execute_statement(&statement, table)) {
+        case (EXECUTE_SUCCESS):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Executed.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            break;
+        case (EXECUTE_TABLE_FULL):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Table full.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            break;
+        case (EXECUTE_DUPLICATE_KEY):
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Duplicate key.\n", -1);
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            break;
+    }
+}
+
+int main(int argc, char *argv[]) {
     if(argc < 2) {
         printf("Must supply a database filename.\n");
         exit(EXIT_FAILURE);
@@ -997,51 +1147,79 @@ int main(int argc, char* argv[]) {
     char* filename = argv[1];
     Table* table = db_open(filename);
 
-    InputBuffer* input_buffer = new_input_buffer();
-    while (true) {
-        print_prompt();
-        read_input(input_buffer);
-
-        if (input_buffer->buffer[0] == '.') {
-            switch (do_meta_command(input_buffer, table)) {
-                case (META_COMMAND_SUCCESS):
-                    continue;
-                case (META_COMMAND_UNRECOGNIZED_COMMAND):
-                    printf("Unrecognized command '%s'\n", input_buffer->buffer);
-                    continue;
-            }
-        }
-        // 处理SQL语句，填充statement中的信息
-        Statement statement;
-        switch (prepare_statement(input_buffer, &statement)) {
-            case (PREPARE_SUCCESS):
-                break;
-            case (PREPARE_NEGATIVE_ID):
-                printf("ID must be positive.\n");
-                continue;
-            case (PREPARE_STRING_TOO_LONG):
-                printf("String is too long.\n");
-                continue;
-            case (PREPARE_SYNTAX_ERROR):
-                printf("Syntax error. Could not parse statement.\n");
-                continue;
-            case (PREPARE_UNRECOGNIZED_STATEMENT):
-                printf("Unrecognized keyword at start of '%s'.\n", input_buffer->buffer);
-                continue;
-        }
-
-        // 执行SQL语句
-        switch (execute_statement(&statement, table)) {
-            case (EXECUTE_SUCCESS):
-                printf("Executed.\n");
-                break;
-            case (EXECUTE_TABLE_FULL):
-                printf("Error: Table full.\n");
-                break;
-            case (EXECUTE_DUPLICATE_KEY):
-                printf("Error: Duplicate key.\n");
-                break;
-        }
-
+    // Debug information to check table pointer
+    if (!table) {
+        printf("Failed to open database.\n");
+        exit(EXIT_FAILURE);
     }
+
+    InputBuffer* input_buffer = new_input_buffer();
+
+    // Debug information to check input_buffer initialization
+    if (!input_buffer || !input_buffer->buffer) {
+        printf("Failed to allocate input buffer.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    GtkWidget *window;
+    GtkWidget *vbox;
+    GtkWidget *scroll_window;
+    GtkWidget *text_view;
+    GtkWidget *execute_button;
+    GtkWidget *output_scroll_window;
+    GtkWidget *output_text_view;
+    GtkWidget *widgets[4]; // 用于传递text_view、table、input_buffer和output_text_view
+
+    gtk_init(&argc, &argv);
+
+    window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(window), "XDB");
+    gtk_window_set_default_size(GTK_WINDOW(window), 1200, 800); // 调整默认窗体大小
+    g_signal_connect(window, "destroy", G_CALLBACK(gtk_main_quit), NULL);
+
+    vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+    gtk_container_add(GTK_CONTAINER(window), vbox);
+
+    // 添加一个滚动窗口容器，用于输入框
+    scroll_window = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_window), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(scroll_window, -1, 100); // 设置输入框的高度为200像素
+    gtk_box_pack_start(GTK_BOX(vbox), scroll_window, FALSE, FALSE, 0);
+
+    text_view = gtk_text_view_new();
+    gtk_container_add(GTK_CONTAINER(scroll_window), text_view);
+
+    execute_button = gtk_button_new_with_label("Execute SQL");
+    gtk_box_pack_start(GTK_BOX(vbox), execute_button, FALSE, FALSE, 0);
+
+    // 添加一个滚动窗口容器，用于输出框
+    output_scroll_window = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(output_scroll_window), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(vbox), output_scroll_window, TRUE, TRUE, 0);
+
+    output_text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(output_text_view), FALSE); // 使其不可编辑
+    gtk_container_add(GTK_CONTAINER(output_scroll_window), output_text_view);
+
+    // 设置字体
+    PangoFontDescription *font_desc = pango_font_description_from_string("Monospace 12");
+    gtk_widget_override_font(text_view, font_desc);
+    gtk_widget_override_font(execute_button, font_desc);
+    gtk_widget_override_font(output_text_view, font_desc);
+    pango_font_description_free(font_desc);
+
+    // 存储text_view、table和input_buffer
+    widgets[0] = text_view;
+    widgets[1] = (GtkWidget *)table;
+    widgets[2] = (GtkWidget *)input_buffer;
+    widgets[3] = output_text_view;
+
+    g_signal_connect(execute_button, "clicked", G_CALLBACK(on_execute_button_clicked), widgets);
+    // 连接回车键事件
+    g_signal_connect(text_view, "key-press-event", G_CALLBACK(on_entry_key_press), NULL);
+    gtk_widget_show_all(window);
+
+    gtk_main();
+
+    return 0;
 }

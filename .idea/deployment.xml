@@ -3,29 +3,15 @@
   <component name="PublishConfigData" serverName="Remote Development" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
-      <paths name="Remote Host (996228e1-db75-490a-a589-4ab610f326d5)">
+      <paths name="Remote Host (5ef9e3b6-ad35-4888-8455-fe676fa840eb)">
         <serverdata>
           <mappings>
-            <mapping deploy="/opt/xdb" local="$PROJECT_DIR$" />
+            <mapping deploy="/tmp/tmp.HT3NnQ9S0Y" local="$PROJECT_DIR$" />
           </mappings>
           <excludedPaths>
             <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug" />
             <excludedPath local="true" path="$PROJECT_DIR$/cmake-build-debug" />
           </excludedPaths>
-        </serverdata>
-      </paths>
-      <paths name="TencentCloud (fdf89ca3-3c8e-4d2a-a848-b70275f637cb)">
-        <serverdata>
-          <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="XDB">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/opt/xdb" local="$PROJECT_DIR$" web="/" />
-          </mappings>
         </serverdata>
       </paths>
     </serverData>
