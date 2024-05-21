@@ -3,16 +3,16 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <sys/stat.h>
 #include <io.h>
 #include <gtk/gtk.h>
 #include <stdarg.h>
 #include <pango/pango.h>
+#include <string.h>
+#include <errno.h>
 
-#define COLUMN_USERNAME_SIZE 32
-#define COLUMN_EMAIL_SIZE 255
 #define TABLE_MAX_PAGES 100
+#define TABLE_MAX_COLS 10
 #define INVALID_PAGE_NUM UINT32_MAX
 
 #define OUTPUT_BUFFER_SIZE 8192
@@ -26,11 +26,32 @@ void append_to_output_buffer(const char *format, ...) {
     va_end(args);
 }
 
+typedef enum {
+    COLUMN_TYPE_INT,
+    COLUMN_TYPE_DOUBLE,
+    COLUMN_TYPE_TEXT
+} ColumnType;
+
+typedef struct {
+    char name[32];
+    ColumnType type;
+} Column;
+
+typedef struct {
+    char name[32];
+    int num_columns;
+    Column columns[10]; // 假设最多支持10列
+    uint32_t row_size; // 行大小
+    uint32_t leaf_node_cell_size; // 叶节点单元大小
+    uint32_t leaf_node_space_for_cells; // 叶节点单元空间
+    uint32_t leaf_node_max_cells; // 叶节点最大单元数
+    uint32_t leaf_node_left_split_count; // 左分裂单元数
+} TableSchema;
+
 // 行属性
 typedef struct {
     uint32_t id;
-    char username[COLUMN_USERNAME_SIZE + 1];
-    char email[COLUMN_EMAIL_SIZE + 1];
+    char* columns[10]; // 动态列值，最多支持10列
 } Row;
 
 #define INPUT_BUFFER_SIZE 1024
@@ -95,6 +116,7 @@ ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
     buffer[i] = '\0';
     return i;
 }
+
 // 读取输入
 void read_input(InputBuffer* input_buffer) {
     ssize_t bytes_read =
@@ -137,7 +159,8 @@ typedef enum {
     PREPARE_SYNTAX_ERROR,
     PREPARE_STRING_TOO_LONG,
     PREPARE_UNRECOGNIZED_STATEMENT,
-    PREPARE_NEGATIVE_ID
+    PREPARE_NEGATIVE_ID,
+    PREPARE_TABLE_NOT_FOUND
 } PrepareResult;
 
 typedef struct {
@@ -150,6 +173,7 @@ typedef struct {
 typedef struct {
     uint32_t root_page_num;
     Pager* pager;
+    TableSchema schema; // 新增：表架构
 } Table;
 
 typedef struct {
@@ -170,7 +194,6 @@ typedef struct {
     bool end_of_table; // 标识表末尾
 } Cursor;
 
-
 // SQL语句类型
 typedef enum {
     STATEMENT_INSERT,
@@ -182,14 +205,19 @@ typedef enum {
 // SQL语句
 typedef struct {
     StatementType type;
-    char table_name[32];  // 表名
-    Row row_to_insert;  // only used by insert statement
+    char table_name[32];
+    int num_columns;          // 列数
+    Column columns[TABLE_MAX_COLS];       // 列信息
+    Row row_to_insert;        // 仅用于插入语句
 } Statement;
 
 // 打印行
-void print_row(Row* row) {
-    append_to_output_buffer("(%d, %s, %s)\n", row->id, row->username, row->email);
-    printf("(%d, %s, %s)\n", row->id, row->username, row->email);
+void print_row(Row* row, TableSchema* schema) {
+    printf("(%d", row->id);
+    for (int i = 0; i < schema->num_columns; i++) {
+        printf(", %s", row->columns[i]);
+    }
+    printf(")\n");
 }
 
 // 打印提示符
@@ -201,17 +229,9 @@ void print_prompt() {
 // 各字段size和offset
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
 
-const uint32_t ID_SIZE = size_of_attribute(Row, id);
-const uint32_t USERNAME_SIZE = size_of_attribute(Row, username);
-const uint32_t EMAIL_SIZE = size_of_attribute(Row, email);
+const uint32_t ID_SIZE = sizeof(uint32_t);
 const uint32_t ID_OFFSET = 0;
-const uint32_t USERNAME_OFFSET = ID_OFFSET + ID_SIZE;
-const uint32_t EMAIL_OFFSET = USERNAME_OFFSET + USERNAME_SIZE;
-const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
-
 const uint32_t PAGE_SIZE = 4096;
-const uint32_t ROWS_PER_PAGE = PAGE_SIZE / ROW_SIZE;
-const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;
 
 // B+树节点类型
 typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
@@ -236,21 +256,6 @@ const uint32_t LEAF_NODE_HEADER_SIZE = COMMON_NODE_HEADER_SIZE
                                        + LEAF_NODE_NUM_CELLS_SIZE
                                        + LEAF_NODE_NEXT_LEAF_SIZE;
 
-// 叶节点内部布局
-const uint32_t LEAF_NODE_KEY_SIZE = sizeof(uint32_t);
-const uint32_t LEAF_NODE_KEY_OFFSET = 0;
-const uint32_t LEAF_NODE_VALUE_SIZE = ROW_SIZE;
-const uint32_t LEAF_NODE_VALUE_OFFSET =
-        LEAF_NODE_KEY_OFFSET + LEAF_NODE_KEY_SIZE;
-const uint32_t LEAF_NODE_CELL_SIZE = LEAF_NODE_KEY_SIZE + LEAF_NODE_VALUE_SIZE;
-const uint32_t LEAF_NODE_SPACE_FOR_CELLS = PAGE_SIZE - LEAF_NODE_HEADER_SIZE;
-const uint32_t LEAF_NODE_MAX_CELLS =
-        LEAF_NODE_SPACE_FOR_CELLS / LEAF_NODE_CELL_SIZE;
-
-// 分裂时，右边比左边相等或者少一个
-const uint32_t LEAF_NODE_RIGHT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) / 2;
-const uint32_t LEAF_NODE_LEFT_SPLIT_COUNT = (LEAF_NODE_MAX_CELLS + 1) - LEAF_NODE_RIGHT_SPLIT_COUNT;
-
 // 内部节点头部布局
 const uint32_t INTERNAL_NODE_NUM_KEYS_SIZE = sizeof(uint32_t);
 const uint32_t INTERNAL_NODE_NUM_KEYS_OFFSET = COMMON_NODE_HEADER_SIZE;
@@ -269,8 +274,6 @@ const uint32_t INTERNAL_NODE_CELL_SIZE =
         INTERNAL_NODE_CHILD_SIZE + INTERNAL_NODE_KEY_SIZE;
 const uint32_t INTERNAL_NODE_MAX_CELLS = 3;
 
-
-
 NodeType get_node_type(void* node) {
     uint8_t value = *((uint8_t*)(node + NODE_TYPE_OFFSET));
     return (NodeType)value;
@@ -286,7 +289,8 @@ uint32_t* leaf_node_num_cells(void* node) {
 }
 
 void* leaf_node_cell(void* node, uint32_t cell_num) {
-    return node + LEAF_NODE_HEADER_SIZE + cell_num * LEAF_NODE_CELL_SIZE;
+    TableSchema* schema = (TableSchema*)(node + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint32_t));
+    return node + LEAF_NODE_HEADER_SIZE + cell_num * schema->leaf_node_cell_size;
 }
 
 uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
@@ -294,7 +298,7 @@ uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
 }
 
 void* leaf_node_value(void* node, uint32_t cell_num) {
-    return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
+    return leaf_node_cell(node, cell_num) + sizeof(uint32_t);
 }
 
 uint32_t* leaf_node_next_leaf(void* node) {
@@ -368,11 +372,12 @@ void set_node_root(void* node, bool is_root) {
     *((uint8_t*)(node + IS_ROOT_OFFSET)) = value;
 }
 
-void initialize_leaf_node(void* node) {
+void initialize_leaf_node(void* node, TableSchema* schema) {
     *leaf_node_num_cells(node) = 0;
     set_node_root(node, false);
     set_node_type(node, NODE_LEAF);
     *leaf_node_next_leaf(node) = 0;
+    memcpy(node + LEAF_NODE_HEADER_SIZE, schema, sizeof(TableSchema)); // 存储表架构
 }
 
 void initialize_internal_node(void* node) {
@@ -382,20 +387,74 @@ void initialize_internal_node(void* node) {
     *internal_node_right_child(node) = INVALID_PAGE_NUM;
 }
 
-// 序列化
-void serialize_row(Row* source, void* destination) {
-    memcpy(destination + ID_OFFSET, &(source->id), ID_SIZE);
-    strncpy(destination + USERNAME_OFFSET, source->username, USERNAME_SIZE);
-    strncpy(destination + EMAIL_OFFSET, source->email, EMAIL_SIZE);
+// 动态计算表结构相关常量
+void calculate_table_constants(TableSchema* schema) {
+    uint32_t row_size = sizeof(uint32_t); // id 大小
+    for (int i = 0; i < schema->num_columns; i++) {
+        switch (schema->columns[i].type) {
+            case COLUMN_TYPE_INT:
+                row_size += sizeof(int);
+            break;
+            case COLUMN_TYPE_DOUBLE:
+                row_size += sizeof(double);
+            break;
+            case COLUMN_TYPE_TEXT:
+                row_size += 255; // 假设最大长度为255
+            break;
+        }
+    }
+
+    schema->row_size = row_size;
+    schema->leaf_node_cell_size = sizeof(uint32_t) + row_size;
+    schema->leaf_node_space_for_cells = 4096 - LEAF_NODE_HEADER_SIZE;
+    schema->leaf_node_max_cells = schema->leaf_node_space_for_cells / schema->leaf_node_cell_size;
+    schema->leaf_node_left_split_count = (schema->leaf_node_max_cells + 1) / 2;
 }
 
-// 反序列化
-void deserialize_row(void* source, Row* destination) {
-    memcpy(&(destination->id), source + ID_OFFSET, ID_SIZE);
-    memcpy(&(destination->username), source + USERNAME_OFFSET, USERNAME_SIZE);
-    memcpy(&(destination->email), source + EMAIL_OFFSET, EMAIL_SIZE);
+
+void serialize_row(Row* source, void* destination, TableSchema* schema) {
+    memcpy(destination, &(source->id), sizeof(uint32_t));
+    uint32_t offset = sizeof(uint32_t);
+    for (int i = 1; i < schema->num_columns; i++) {
+        switch (schema->columns[i].type) {
+            case COLUMN_TYPE_INT:
+                memcpy(destination + offset, source->columns[i], sizeof(int));
+                offset += sizeof(int);
+                break;
+            case COLUMN_TYPE_DOUBLE:
+                memcpy(destination + offset, source->columns[i], sizeof(double));
+                offset += sizeof(double);
+                break;
+            case COLUMN_TYPE_TEXT:
+                strcpy(destination + offset, source->columns[i]);
+                offset += strlen(source->columns[i]) + 1;
+                break;
+        }
+    }
 }
 
+void deserialize_row(void* source, Row* destination, TableSchema* schema) {
+    memcpy(&(destination->id), source, sizeof(uint32_t));
+    uint32_t offset = sizeof(uint32_t);
+    for (int i = 0; i < schema->num_columns; i++) {
+        switch (schema->columns[i].type) {
+            case COLUMN_TYPE_INT:
+                destination->columns[i] = malloc(sizeof(int));
+                memcpy(destination->columns[i], source + offset, sizeof(int));
+                offset += sizeof(int);
+                break;
+            case COLUMN_TYPE_DOUBLE:
+                destination->columns[i] = malloc(sizeof(double));
+                memcpy(destination->columns[i], source + offset, sizeof(double));
+                offset += sizeof(double);
+                break;
+            case COLUMN_TYPE_TEXT:
+                destination->columns[i] = strdup(source + offset);
+                offset += strlen(source + offset) + 1;
+                break;
+        }
+    }
+}
 
 // 获取页面
 void* get_page(Pager* pager, uint32_t page_num) {
@@ -417,7 +476,7 @@ void* get_page(Pager* pager, uint32_t page_num) {
 
         // 如果请求的页面位于文件的范围之外，我们知道它应该是空白的，所以我们只需分配一些内存并返回它。稍后将缓存刷新到磁盘时，该页面将被添加到文件中。
         if (page_num <= num_pages) {
-             lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+            lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
             ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
 
             if (bytes_read == -1) {
@@ -493,13 +552,12 @@ void db_close(Table* table) {
     free(table);
 }
 
-void print_constants() {
-    printf("ROW_SIZE: %d\n", ROW_SIZE);
-    printf("COMMON_NODE_HEADER_SIZE: %d\n", COMMON_NODE_HEADER_SIZE);
-    printf("LEAF_NODE_HEADER_SIZE: %d\n", LEAF_NODE_HEADER_SIZE);
-    printf("LEAF_NODE_CELL_SIZE: %d\n", LEAF_NODE_CELL_SIZE);
-    printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", LEAF_NODE_SPACE_FOR_CELLS);
-    printf("LEAF_NODE_MAX_CELLS: %d\n", LEAF_NODE_MAX_CELLS);
+void print_constants(TableSchema* schema) {
+    printf("ROW_SIZE: %d\n", schema->row_size);
+    printf("LEAF_NODE_CELL_SIZE: %d\n", schema->leaf_node_cell_size);
+    printf("LEAF_NODE_SPACE_FOR_CELLS: %d\n", schema->leaf_node_space_for_cells);
+    printf("LEAF_NODE_MAX_CELLS: %d\n", schema->leaf_node_max_cells);
+    printf("LEAF_NODE_LEFT_SPLIT_COUNT: %d\n", schema->leaf_node_left_split_count);
 }
 
 // B+树可视化
@@ -542,7 +600,6 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level) {
     }
 }
 
-
 // 处理元命令
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db) {
     if (strcmp(input_buffer->buffer, ".exit") == 0) {
@@ -552,7 +609,9 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db) {
         exit(EXIT_SUCCESS);
     } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
         printf("Constants:\n");
-        print_constants();
+        for (int i = 0; i < db->table_count; i++) {
+            print_constants(&db->tables[i].table->schema);
+        }
         return META_COMMAND_SUCCESS;
     } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
         for (int i = 0; i < db->table_count; i++) {
@@ -564,8 +623,6 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db) {
         return META_COMMAND_UNRECOGNIZED_COMMAND;
     }
 }
-
-
 
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
     void* node = get_page(table->pager, page_num);
@@ -595,10 +652,6 @@ Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
     cursor->cell_num = min_index;
     return cursor;
 }
-
-
-
-
 
 uint32_t internal_node_find_child(void* node, uint32_t key) {
     uint32_t num_keys = *internal_node_num_keys(node);
@@ -666,7 +719,6 @@ Cursor* table_start(Table* table) {
     return cursor;
 }
 
-
 // 获取指向光标所描述位置的指针
 void* cursor_value(Cursor* cursor) {
     uint32_t page_num = cursor->page_num;
@@ -708,7 +760,6 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
         initialize_internal_node(right_child);
         initialize_internal_node(left_child);
     }
-
 
     /* Left child has data copied from old root */
     memcpy(left_child, root, PAGE_SIZE);
@@ -883,34 +934,34 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
     uint32_t old_max = get_node_max_key(cursor->table->pager, old_node);
     uint32_t new_page_num = get_unused_page_num(cursor->table->pager);
     void* new_node = get_page(cursor->table->pager, new_page_num);
-    initialize_leaf_node(new_node);
+    initialize_leaf_node(new_node, &cursor->table->schema);
     *node_parent(new_node) = *node_parent(old_node);
     *leaf_node_next_leaf(new_node) = *leaf_node_next_leaf(old_node);
     *leaf_node_next_leaf(old_node) = new_page_num;
-    for (int32_t i = LEAF_NODE_MAX_CELLS; i >= 0; i--) {
+    for (int32_t i = cursor->table->schema.leaf_node_max_cells; i >= 0; i--) {
         void* destination_node;
-        if (i >= LEAF_NODE_LEFT_SPLIT_COUNT) {
+        if (i >= cursor->table->schema.leaf_node_left_split_count) {
             destination_node = new_node;
         } else {
             destination_node = old_node;
         }
-        uint32_t index_within_node = i % LEAF_NODE_LEFT_SPLIT_COUNT;
+        uint32_t index_within_node = i % cursor->table->schema.leaf_node_left_split_count;
         void* destination = leaf_node_cell(destination_node, index_within_node);
 
         if (i == cursor->cell_num) {
-            serialize_row(value,leaf_node_value(destination_node, index_within_node));
+            serialize_row(value, leaf_node_value(destination_node, index_within_node), &cursor->table->schema);
             *leaf_node_key(destination_node, index_within_node) = key;
         } else if (i > cursor->cell_num) {
-            memcpy(destination, leaf_node_cell(old_node, i - 1), LEAF_NODE_CELL_SIZE);
+            memcpy(destination, leaf_node_cell(old_node, i - 1), cursor->table->schema.leaf_node_cell_size);
         } else {
-            memcpy(destination, leaf_node_cell(old_node, i), LEAF_NODE_CELL_SIZE);
+            memcpy(destination, leaf_node_cell(old_node, i), cursor->table->schema.leaf_node_cell_size);
         }
     }
-    *(leaf_node_num_cells(old_node)) = LEAF_NODE_LEFT_SPLIT_COUNT;
-    *(leaf_node_num_cells(new_node)) = LEAF_NODE_RIGHT_SPLIT_COUNT;
+    *(leaf_node_num_cells(old_node)) = cursor->table->schema.leaf_node_left_split_count;
+    *(leaf_node_num_cells(new_node)) = cursor->table->schema.leaf_node_max_cells - cursor->table->schema.leaf_node_left_split_count;
     if (is_node_root(old_node)) {
         return create_new_root(cursor->table, new_page_num);
-        } else {
+    } else {
         uint32_t parent_page_num = *node_parent(old_node);
         uint32_t new_max = get_node_max_key(cursor->table->pager, old_node);
         void* parent = get_page(cursor->table->pager, parent_page_num);
@@ -923,77 +974,150 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
 void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
     void* node = get_page(cursor->table->pager, cursor->page_num);
     uint32_t num_cells = *leaf_node_num_cells(node);
-    if (num_cells >= LEAF_NODE_MAX_CELLS) {
+    if (num_cells >= cursor->table->schema.leaf_node_max_cells) {
         leaf_node_split_and_insert(cursor, key, value);
         return;
     }
     // 单元格向右移动一个空格，为新单元格腾出空间
     if(cursor->cell_num < num_cells) {
         for (uint32_t i = num_cells; i > cursor->cell_num; i--) {
-            memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i - 1), LEAF_NODE_CELL_SIZE);
+            memcpy(leaf_node_cell(node, i), leaf_node_cell(node, i - 1), cursor->table->schema.leaf_node_cell_size);
         }
     }
     *(leaf_node_num_cells(node)) += 1;
     *(leaf_node_key(node, cursor->cell_num)) = key;
-    serialize_row(value, leaf_node_value(node, num_cells));
+    serialize_row(value, leaf_node_value(node, cursor->cell_num), &cursor->table->schema);
 }
 
+Table* find_table(Database* db, const char* table_name) {
+    for (int i = 0; i < db->table_count; i++) {
+        if (strcmp(db->tables[i].name, table_name) == 0) {
+            return db->tables[i].table;
+        }
+    }
+    return NULL;
+}
 
 // SQL compiler
-PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement) {
+PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement, Database* db) {
     statement->type = STATEMENT_INSERT;
 
     char* keyword = strtok(input_buffer->buffer, " ");
-    char* id_string = strtok(NULL, " ");
-    char* username = strtok(NULL, " ");
-    char* email = strtok(NULL, " ");
+    char* table_name = strtok(NULL, " ");
 
-    if (id_string == NULL || username == NULL || email == NULL) {
+    if (table_name == NULL) {
         return PREPARE_SYNTAX_ERROR;
     }
 
-    int id = atoi(id_string);
-    if(id < 0) {
-        return PREPARE_NEGATIVE_ID;
-    }
-    if (strlen(username) > COLUMN_USERNAME_SIZE || strlen(email) > COLUMN_EMAIL_SIZE) {
-        return PREPARE_STRING_TOO_LONG;
+    Table* table = find_table(db, table_name);
+    if (table == NULL) {
+        return PREPARE_TABLE_NOT_FOUND;
     }
 
-    statement->row_to_insert.id = id;
-    strcpy(statement->row_to_insert.username, username);
-    strcpy(statement->row_to_insert.email, email);
+    for (int i = 0; i < table->schema.num_columns; i++) {
+        char* column_value = strtok(NULL, " ");
+        if (column_value == NULL) {
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        if (table->schema.columns[i].type == COLUMN_TYPE_TEXT && strlen(column_value) > 255) {
+            return PREPARE_STRING_TOO_LONG;
+        }
+
+        if (table->schema.columns[i].type == COLUMN_TYPE_INT) {
+            if(i == 0) {
+                int id = atoi(column_value);
+                statement->row_to_insert.id = id;
+                if(id < 0) {
+                    return PREPARE_NEGATIVE_ID;
+                }
+            }
+            int* int_value = malloc(sizeof(int));
+            *int_value = atoi(column_value);
+            statement->row_to_insert.columns[i] = (char*)int_value;
+        } else if (table->schema.columns[i].type == COLUMN_TYPE_DOUBLE) {
+            double* double_value = malloc(sizeof(double));
+            *double_value = atof(column_value);
+            statement->row_to_insert.columns[i] = (char*)double_value;
+        } else if (table->schema.columns[i].type == COLUMN_TYPE_TEXT) {
+            statement->row_to_insert.columns[i] = strdup(column_value);
+        }
+    }
+
+    strcpy(statement->table_name, table_name);
 
     return PREPARE_SUCCESS;
 }
 
-PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement) {
-    if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
-        statement->type = STATEMENT_INSERT;
-        char* keyword = strtok(input_buffer->buffer, " ");
-        char* table_name = strtok(NULL, " ");
-        char* id_string = strtok(NULL, " ");
-        char* username = strtok(NULL, " ");
-        char* email = strtok(NULL, " ");
+PrepareResult prepare_create_table(InputBuffer* input_buffer, Statement* statement) {
+    statement->type = STATEMENT_CREATE_TABLE;
 
-        if (table_name == NULL || id_string == NULL || username == NULL || email == NULL) {
+    char* buffer = strdup(input_buffer->buffer); // 复制缓冲区以避免修改原始输入
+
+    // 提取表名
+    char* keyword = strtok(buffer, " "); // create
+    keyword = strtok(NULL, " "); // table
+    char* table_name = strtok(NULL, " ("); // table name
+
+    if (table_name == NULL) {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    strcpy(statement->table_name, table_name);
+
+    // 提取列定义部分
+    char* columns_def = strtok(NULL, "("); // 获取剩余的字符串部分
+    if (columns_def == NULL) {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    // 去除末尾的括号
+    char* end_parenthesis = strchr(columns_def, ')');
+    if (end_parenthesis != NULL) {
+        *end_parenthesis = '\0';
+    } else {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+    char *cols[TABLE_MAX_COLS];
+
+    // 分割列定义并解析每个列
+    for(char *str = strtok(columns_def, ","); str != NULL; str = strtok(NULL, ",")) {
+        cols[statement->num_columns] = str;
+        statement->num_columns++;
+    }
+    for(int i = 0; i < statement->num_columns; i++) {
+        char* column_name = strtok(cols[i], " ");
+        while(*column_name == ' ') column_name++;
+        char*column_type_str = strtok(NULL, " ");
+        while(*column_type_str == ' ') column_type_str++;
+        if (strcmp(column_type_str, "int") == 0) {
+            statement->columns[i].type = COLUMN_TYPE_INT;
+        } else if (strcmp(column_type_str, "double") == 0) {
+            statement->columns[i].type = COLUMN_TYPE_DOUBLE;
+        } else if (strcmp(column_type_str, "text") == 0) {
+            statement->columns[i].type = COLUMN_TYPE_TEXT;
+        } else {
+            free(buffer);
             return PREPARE_SYNTAX_ERROR;
         }
+        strncpy(statement->columns[i].name, column_name, 32);
 
-        int id = atoi(id_string);
-        if (id < 0) {
-            return PREPARE_NEGATIVE_ID;
-        }
-        if (strlen(username) > COLUMN_USERNAME_SIZE || strlen(email) > COLUMN_EMAIL_SIZE) {
-            return PREPARE_STRING_TOO_LONG;
-        }
+    }
 
-        statement->row_to_insert.id = id;
-        strcpy(statement->row_to_insert.username, username);
-        strcpy(statement->row_to_insert.email, email);
-        strcpy(statement->table_name, table_name);
+    free(buffer);
+    return PREPARE_SUCCESS;
+}
 
-        return PREPARE_SUCCESS;
+
+
+
+
+PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement, Database* db) {
+    if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
+        return prepare_insert(input_buffer, statement, db);
     }
 
     if (strncmp(input_buffer->buffer, "select", 6) == 0) {
@@ -1010,17 +1134,7 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
     }
 
     if (strncmp(input_buffer->buffer, "create table", 12) == 0) {
-        statement->type = STATEMENT_CREATE_TABLE;
-        char* keyword1 = strtok(input_buffer->buffer, " ");
-        char* keyword2 = strtok(NULL, " ");
-        char* table_name = strtok(NULL, " ");
-
-        if (table_name == NULL) {
-            return PREPARE_SYNTAX_ERROR;
-        }
-
-        strcpy(statement->table_name, table_name);
-        return PREPARE_SUCCESS;
+        return prepare_create_table(input_buffer, statement);
     }
 
     if (strcmp(input_buffer->buffer, "show tables") == 0) {
@@ -1064,32 +1178,43 @@ Pager* pager_open(const char* filename) {
 }
 
 // 创建表
-Table* db_open(const char* filename) {
+Table* db_open(const char* filename, TableSchema* schema) {
     Pager* pager = pager_open(filename);
     Table* table = (Table*)malloc(sizeof(Table));
     table->pager = pager;
     table->root_page_num = 0;
     if (pager->num_pages == 0) {
         void* root_node = get_page(pager, 0);
-        initialize_leaf_node(root_node);
+        initialize_leaf_node(root_node, schema);
         set_node_root(root_node, true);
     }
+    table->schema = *schema;
     return table;
 }
+
 ExecuteResult execute_create_table(Statement* statement, Database* db) {
     if (db->table_count >= 100) {
         return EXECUTE_TABLE_FULL;
     }
 
-    Table* table = db_open(statement->table_name);
+    TableSchema schema;
+    strcpy(schema.name, statement->table_name);
+    schema.num_columns = statement->num_columns;
+    for (int i = 0; i < statement->num_columns; i++) {
+        schema.columns[i] = statement->columns[i];
+    }
+    calculate_table_constants(&schema);
+
+    Table* table = db_open(statement->table_name, &schema);
     if (!table) {
         return EXECUTE_FAILURE;
     }
 
-    strcpy(db->tables[db->table_count].name, statement->table_name);
-    db->tables[db->table_count].table = table;
-    db->table_count++;
+    TableInfo* table_info = &db->tables[db->table_count];
+    strcpy(table_info->name, statement->table_name);
+    table_info->table = table;
 
+    db->table_count++;
     return EXECUTE_SUCCESS;
 }
 
@@ -1101,14 +1226,6 @@ ExecuteResult execute_show_tables(Database* db) {
     return EXECUTE_SUCCESS;
 }
 
-Table* find_table(Database* db, const char* table_name) {
-    for (int i = 0; i < db->table_count; i++) {
-        if (strcmp(db->tables[i].name, table_name) == 0) {
-            return db->tables[i].table;
-        }
-    }
-    return NULL;
-}
 
 ExecuteResult execute_insert(Statement* statement, Database* db) {
     Table* table = find_table(db, statement->table_name);
@@ -1141,8 +1258,8 @@ ExecuteResult execute_select(Statement* statement, Database* db) {
     Cursor* cursor = table_start(table);
     Row row;
     while (!(cursor->end_of_table)) {
-        deserialize_row(cursor_value(cursor), &row);
-        print_row(&row);
+        deserialize_row(cursor_value(cursor), &row, &table->schema);
+        print_row(&row, &table->schema);
         cursor_advance(cursor);
     }
     free(cursor);
@@ -1164,10 +1281,6 @@ ExecuteResult execute_statement(Statement* statement, Database* db) {
     }
 }
 
-
-
-
-
 gboolean on_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data) {
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(widget));
     if (event->keyval == GDK_KEY_Return || event->keyval == GDK_KEY_KP_Enter) {
@@ -1180,10 +1293,16 @@ gboolean on_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data
 }
 
 void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
+
     // 从data中获取text_view、database和input_buffer
     GtkWidget **widgets = (GtkWidget **)data;
     GtkWidget *text_view = widgets[0];
     Database *db = (Database *)widgets[1];
+    // 打印B树节点
+    for (int i = 0; i < db->table_count; i++) {
+        printf("Table: %s\n", db->tables[i].name);
+        print_tree(db->tables[i].table->pager, 0, 0);
+    }
     InputBuffer *input_buffer = (InputBuffer *)widgets[2];
     GtkWidget *output_text_view = widgets[3];
 
@@ -1223,7 +1342,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     }
 
     Statement statement;
-    switch (prepare_statement(input_buffer, &statement)) {
+    switch (prepare_statement(input_buffer, &statement, db)) {
         case (PREPARE_SUCCESS):
             break;
         case (PREPARE_NEGATIVE_ID):
@@ -1263,7 +1382,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             break;
     }
 }
-
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -1338,4 +1456,3 @@ int main(int argc, char *argv[]) {
 
     return 0;
 }
-
