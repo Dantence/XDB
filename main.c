@@ -620,31 +620,6 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level, Tab
 }
 
 
-// 处理元命令
-MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db) {
-    if (strcmp(input_buffer->buffer, ".exit") == 0) {
-        for (int i = 0; i < db->table_count; i++) {
-            table_close(db->tables[i]);
-        }
-        exit(EXIT_SUCCESS);
-    } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
-        printf("Constants:\n");
-        for (int i = 0; i < db->table_count; i++) {
-            print_constants(&db->tables[i]->schema);
-        }
-        return META_COMMAND_SUCCESS;
-    } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
-        for (int i = 0; i < db->table_count; i++) {
-            printf("Table: %s\n", db->tables[i]->schema.name);
-            print_tree(db->tables[i]->pager, 0, 0, &db->tables[i]->schema);
-        }
-        return META_COMMAND_SUCCESS;
-    } else {
-        return META_COMMAND_UNRECOGNIZED_COMMAND;
-    }
-}
-
-
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
     void* node = get_page(table->pager, page_num);
     uint32_t num_cells = *leaf_node_num_cells(node);
@@ -1294,6 +1269,68 @@ gboolean on_entry_key_press(GtkWidget *widget, GdkEventKey *event, gpointer data
     return FALSE; // 允许其他按键的默认行为
 }
 
+void save_database(Database* db, const char* db_file) {
+    char meta_filename[64];
+    snprintf(meta_filename, sizeof(meta_filename), "%s.meta", db_file);
+    FILE* meta_file = fopen(meta_filename, "wb");
+    if (!meta_file) {
+        perror("Unable to open metadata file for writing");
+        exit(EXIT_FAILURE);
+    }
+
+    fwrite(&db->table_count, sizeof(int), 1, meta_file);
+    for (int i = 0; i < db->table_count; i++) {
+        fwrite(&db->tables[i]->schema, sizeof(TableSchema), 1, meta_file); // 写入表架构
+    }
+    fclose(meta_file);
+
+    for (int i = 0; i < db->table_count; i++) {
+        table_close(db->tables[i]);
+    }
+}
+
+void load_database(Database* db, const char* db_file) {
+    char meta_filename[64];
+    snprintf(meta_filename, sizeof(meta_filename), "%s.meta", db_file);
+    FILE* meta_file = fopen(meta_filename, "rb");
+    if (!meta_file) {
+        // No existing database, start fresh
+        db->table_count = 0;
+        return;
+    }
+
+    fread(&db->table_count, sizeof(int), 1, meta_file);
+    for (int i = 0; i < db->table_count; i++) {
+        db->tables[i] = (Table*)malloc(sizeof(Table)); // 初始化 Table 对象
+        fread(&db->tables[i]->schema, sizeof(TableSchema), 1, meta_file); // 读取表架构
+        db->tables[i]->pager = pager_open(db->tables[i]->schema.name); // 使用表架构中的表名
+        db->tables[i]->root_page_num = 0;
+    }
+    fclose(meta_file);
+}
+
+// 处理元命令
+MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db, const char* db_file) {
+    if (strcmp(input_buffer->buffer, ".exit") == 0) {
+        save_database(db, db_file);
+        exit(EXIT_SUCCESS);
+    } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
+        printf("Constants:\n");
+        for (int i = 0; i < db->table_count; i++) {
+            print_constants(&db->tables[i]->schema);
+        }
+        return META_COMMAND_SUCCESS;
+    } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
+        for (int i = 0; i < db->table_count; i++) {
+            printf("Table: %s\n", db->tables[i]->schema.name);
+            print_tree(db->tables[i]->pager, 0, 0, &db->tables[i]->schema);
+        }
+        return META_COMMAND_SUCCESS;
+    } else {
+        return META_COMMAND_UNRECOGNIZED_COMMAND;
+    }
+}
+
 void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
 
     // 从data中获取text_view、database和input_buffer
@@ -1302,6 +1339,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     Database *db = (Database *)widgets[1];
     InputBuffer *input_buffer = (InputBuffer *)widgets[2];
     GtkWidget *output_text_view = widgets[3];
+    const char* db_file = (const char*)widgets[4]; // 获取db_file
 
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
     GtkTextIter start, end;
@@ -1326,7 +1364,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
 
     if (input_buffer->buffer[0] == '.') {
-        switch (do_meta_command(input_buffer, db)) {
+        switch (do_meta_command(input_buffer, db, db_file)) {
             case (META_COMMAND_SUCCESS):
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Meta-command executed successfully.\n", -1);
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
@@ -1389,6 +1427,8 @@ int main(int argc, char *argv[]) {
     Database db;
     db.table_count = 0;
 
+    load_database(&db, db_file);  // Load the database state
+
     InputBuffer* input_buffer = new_input_buffer();
 
     GtkWidget *window;
@@ -1398,7 +1438,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *execute_button;
     GtkWidget *output_scroll_window;
     GtkWidget *output_text_view;
-    GtkWidget *widgets[4]; // 用于传递text_view、table、input_buffer和output_text_view
+    GtkWidget *widgets[5]; // 用于传递text_view、table、input_buffer、output_text_view和db_file
 
     gtk_init(&argc, &argv);
 
@@ -1413,7 +1453,7 @@ int main(int argc, char *argv[]) {
     // 添加一个滚动窗口容器，用于输入框
     scroll_window = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_window), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_widget_set_size_request(scroll_window, -1, 100); // 设置输入框的高度为200像素
+    gtk_widget_set_size_request(scroll_window, -1, 100); // 设置输入框的高度为100像素
     gtk_box_pack_start(GTK_BOX(vbox), scroll_window, FALSE, FALSE, 0);
 
     text_view = gtk_text_view_new();
@@ -1443,6 +1483,7 @@ int main(int argc, char *argv[]) {
     widgets[1] = (GtkWidget *)&db;
     widgets[2] = (GtkWidget *)input_buffer;
     widgets[3] = output_text_view;
+    widgets[4] = (GtkWidget *)db_file; // 添加db_file
 
     g_signal_connect(execute_button, "clicked", G_CALLBACK(on_execute_button_clicked), widgets);
     // 连接回车键事件
@@ -1450,6 +1491,8 @@ int main(int argc, char *argv[]) {
     gtk_widget_show_all(window);
 
     gtk_main();
+
+    save_database(&db, db_file);  // Ensure database is saved on normal exit
 
     return 0;
 }
