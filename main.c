@@ -124,6 +124,23 @@ void close_input_buffer(InputBuffer* input_buffer) {
     free(input_buffer);
 }
 
+// Cache
+typedef struct CacheNode {
+    uint32_t page_num;
+    void* page_data;
+    struct CacheNode* prev;
+    struct CacheNode* next;
+} CacheNode;
+
+typedef struct LRUCache {
+    uint32_t capacity;
+    uint32_t size;
+    CacheNode* head;
+    CacheNode* tail;
+    CacheNode* page_map[TABLE_MAX_PAGES]; // 映射页码到缓存节点
+} LRUCache;
+
+
 // 执行结果
 typedef enum {
     EXECUTE_SUCCESS,
@@ -154,6 +171,7 @@ typedef struct {
     uint32_t file_length;
     uint32_t num_pages;
     void* pages[TABLE_MAX_PAGES];
+    LRUCache* cache;
 } Pager;
 
 typedef struct {
@@ -493,6 +511,55 @@ void deserialize_row(void* source, Row* destination, TableSchema* schema) {
     }
 }
 
+void move_to_head(LRUCache* cache, CacheNode* node) {
+    if (cache->head == node) return;
+
+    // Remove node from current position
+    if (node->prev) node->prev->next = node->next;
+    if (node->next) node->next->prev = node->prev;
+    if (cache->tail == node) cache->tail = node->prev;
+
+    // Move node to head
+    node->next = cache->head;
+    node->prev = NULL;
+    if (cache->head) cache->head->prev = node;
+    cache->head = node;
+    if (cache->tail == NULL) cache->tail = node;
+}
+
+CacheNode* remove_tail(LRUCache* cache) {
+    if (cache->tail == NULL) return NULL;
+    CacheNode* node = cache->tail;
+    if (node->prev) node->prev->next = NULL;
+    cache->tail = node->prev;
+    if (cache->tail == NULL) cache->head = NULL;
+    return node;
+}
+
+void add_to_cache(LRUCache* cache, uint32_t page_num, void* page_data) {
+    if (cache->size >= cache->capacity) {
+        // Cache is full, remove the least recently used page
+        CacheNode* old_node = remove_tail(cache);
+        if (old_node) {
+            free(old_node->page_data);
+            cache->page_map[old_node->page_num] = NULL;
+            free(old_node);
+            cache->size--;
+        }
+    }
+
+    // Add new page to cache
+    CacheNode* new_node = malloc(sizeof(CacheNode));
+    new_node->page_num = page_num;
+    new_node->page_data = page_data;
+    new_node->prev = NULL;
+    new_node->next = cache->head;
+    if (cache->head) cache->head->prev = new_node;
+    cache->head = new_node;
+    if (cache->tail == NULL) cache->tail = new_node;
+    cache->page_map[page_num] = new_node;
+    cache->size++;
+}
 
 
 // 获取页面
@@ -503,34 +570,38 @@ void* get_page(Pager* pager, uint32_t page_num) {
         exit(EXIT_FAILURE);
     }
 
-    if (pager->pages[page_num] == NULL) {
-        // 缓存未命中，分配内存
-        void* page = malloc(PAGE_SIZE);
-        uint32_t num_pages = pager->file_length / PAGE_SIZE;
+    // Check LRU Cache first
+    CacheNode* node = pager->cache->page_map[page_num];
+    if (node) {
+        // Move node to head of LRU list
+        move_to_head(pager->cache, node);
+        return node->page_data;
+    }
 
-        // 未满页
-        if (pager->file_length % PAGE_SIZE) {
-            num_pages += 1;
-        }
+    // Cache miss: Load page from disk
+    void* page = malloc(PAGE_SIZE);
+    uint32_t num_pages = pager->file_length / PAGE_SIZE;
 
-        // 如果请求的页面位于文件的范围之外，我们知道它应该是空白的，所以我们只需分配一些内存并返回它。稍后将缓存刷新到磁盘时，该页面将被添加到文件中。
-        if (page_num <= num_pages) {
-            lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
-            ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+    // 未满页
+    if (pager->file_length % PAGE_SIZE) {
+        num_pages += 1;
+    }
 
-            if (bytes_read == -1) {
-                printf("Error reading file: %d\n", errno);
-                exit(EXIT_FAILURE);
-            }
-        }
-        pager->pages[page_num] = page;
-        if (page_num >= pager->num_pages) {
-            pager->num_pages = page_num + 1;
+    if (page_num <= num_pages) {
+        lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+        ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+
+        if (bytes_read == -1) {
+            printf("Error reading file: %d\n", errno);
+            exit(EXIT_FAILURE);
         }
     }
 
-    return pager->pages[page_num];
+    // Add page to LRU Cache
+    add_to_cache(pager->cache, page_num, page);
+    return page;
 }
+
 
 uint32_t get_node_max_key(Pager* pager, void* node, TableSchema* schema) {
     if (get_node_type(node) == NODE_LEAF) {
@@ -1460,8 +1531,20 @@ Pager* pager_open(const char* filename) {
     for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
         pager->pages[i] = NULL;
     }
+
+    // Initialize LRU cache
+    pager->cache = malloc(sizeof(LRUCache));
+    pager->cache->capacity = 10; // 设置缓存容量
+    pager->cache->size = 0;
+    pager->cache->head = NULL;
+    pager->cache->tail = NULL;
+    for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+        pager->cache->page_map[i] = NULL;
+    }
+
     return pager;
 }
+
 
 // 创建表
 Table* table_open(const char* filename, TableSchema* schema) {
