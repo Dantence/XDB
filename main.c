@@ -213,6 +213,10 @@ typedef struct {
     int num_columns;          // 列数
     Column columns[TABLE_MAX_COLS];       // 列信息
     Row row_to_insert;        // 仅用于插入语句
+    char condition_column[32];
+    char condition_operator[3];
+    char condition_value[32];
+    bool has_condition;
 } Statement;
 
 // 打印行
@@ -1226,6 +1230,30 @@ PrepareResult prepare_select(InputBuffer* input_buffer, Statement* statement, Da
         return PREPARE_SYNTAX_ERROR;
     }
 
+    // Find the position of "WHERE"
+    char* where_pos = strstr(table_name, " where ");
+    if (where_pos != NULL) {
+        *where_pos = '\0'; // Null-terminate table name
+        where_pos += strlen(" where ");
+        // Parse WHERE condition
+        char* condition_column = strtok(where_pos, " ");
+        char* condition_operator = strtok(NULL, " ");
+        char* condition_value = strtok(NULL, " ");
+
+        if (condition_column == NULL || condition_operator == NULL || condition_value == NULL) {
+            free(buffer);
+            free(columns_str);
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        strcpy(statement->condition_column, condition_column);
+        strcpy(statement->condition_operator, condition_operator);
+        strcpy(statement->condition_value, condition_value);
+        statement->has_condition = true;
+    } else {
+        statement->has_condition = false;
+    }
+
     if (strcmp(columns_str, "*") == 0) {
         statement->num_columns = 0; // Select all columns
     } else {
@@ -1243,6 +1271,7 @@ PrepareResult prepare_select(InputBuffer* input_buffer, Statement* statement, Da
     free(columns_str);
     return PREPARE_SUCCESS;
 }
+
 
 PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Database* db) {
     statement->type = STATEMENT_UPDATE;
@@ -1679,38 +1708,62 @@ ExecuteResult execute_select(Statement* statement, Database* db) {
     while (!(cursor->end_of_table)) {
         deserialize_row(cursor_value(cursor), &row, &table->schema);
 
-        if (statement->num_columns == 0) {
-            // Select all columns
-            print_row(&row, &table->schema);
-        } else {
-            // Select specific columns
-            char buffer[1024];
-            int offset = snprintf(buffer, sizeof(buffer), "(%d", row.id);
+        bool condition_met = true;
+        if (statement->has_condition) {
+            // Check condition
+            for (int i = 0; i < table->schema.num_columns; i++) {
+                if (strcmp(statement->condition_column, table->schema.columns[i].name) == 0) {
+                    if (table->schema.columns[i].type == COLUMN_TYPE_INT) {
+                        int column_value = *((int*)row.columns[i]);
+                        int condition_value = atoi(statement->condition_value);
+                        if (strcmp(statement->condition_operator, "=") == 0 && column_value != condition_value) {
+                            condition_met = false;
+                        } else if (strcmp(statement->condition_operator, "<") == 0 && column_value >= condition_value) {
+                            condition_met = false;
+                        } else if (strcmp(statement->condition_operator, ">") == 0 && column_value <= condition_value) {
+                            condition_met = false;
+                        }
+                        // Add more operators as needed
+                    }
+                    // Add conditions for other types (DOUBLE, TEXT) as needed
+                }
+            }
+        }
 
-            for (int i = 0; i < statement->num_columns; i++) {
-                for (int j = 0; j < table->schema.num_columns; j++) {
-                    if (strcmp(statement->columns[i].name, table->schema.columns[j].name) == 0) {
-                        switch (table->schema.columns[j].type) {
-                            case COLUMN_TYPE_INT:
-                                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %d", *((int*)row.columns[j]));
-                                break;
-                            case COLUMN_TYPE_DOUBLE:
-                                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %.2f", *((double*)row.columns[j]));
-                                break;
-                            case COLUMN_TYPE_TEXT:
-                                if (!g_utf8_validate(row.columns[j], -1, NULL)) {
-                                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", "<Invalid UTF-8>");
-                                } else {
-                                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", row.columns[j]);
-                                }
-                                break;
+        if (condition_met) {
+            if (statement->num_columns == 0) {
+                // Select all columns
+                print_row(&row, &table->schema);
+            } else {
+                // Select specific columns
+                char buffer[1024];
+                int offset = snprintf(buffer, sizeof(buffer), "(%d", row.id);
+
+                for (int i = 0; i < statement->num_columns; i++) {
+                    for (int j = 0; j < table->schema.num_columns; j++) {
+                        if (strcmp(statement->columns[i].name, table->schema.columns[j].name) == 0) {
+                            switch (table->schema.columns[j].type) {
+                                case COLUMN_TYPE_INT:
+                                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %d", *((int*)row.columns[j]));
+                                    break;
+                                case COLUMN_TYPE_DOUBLE:
+                                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %.2f", *((double*)row.columns[j]));
+                                    break;
+                                case COLUMN_TYPE_TEXT:
+                                    if (!g_utf8_validate(row.columns[j], -1, NULL)) {
+                                        offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", "<Invalid UTF-8>");
+                                    } else {
+                                        offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", row.columns[j]);
+                                    }
+                                    break;
+                            }
                         }
                     }
                 }
-            }
 
-            snprintf(buffer + offset, sizeof(buffer) - offset, ")\n");
-            append_to_output_buffer("%s", buffer);
+                snprintf(buffer + offset, sizeof(buffer) - offset, ")\n");
+                append_to_output_buffer("%s", buffer);
+            }
         }
 
         cursor_advance(cursor);
@@ -2036,33 +2089,59 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             Row row;
             while (!(cursor->end_of_table)) {
                 deserialize_row(cursor_value(cursor), &row, &table->schema);
-                gtk_list_store_append(result_store, &tree_iter);
-                for (int i = 0; i < num_columns; i++) {
-                    char buffer[256];
-                    const char* col_name = statement.num_columns > 0 ? statement.columns[i].name : table->schema.columns[i].name;
-                    int col_index = -1;
-                    for (int j = 0; j < table->schema.num_columns; j++) {
-                        if (strcmp(col_name, table->schema.columns[j].name) == 0) {
-                            col_index = j;
-                            break;
+
+                bool condition_met = true;
+                if (statement.has_condition) {
+                    // Check condition
+                    for (int i = 0; i < table->schema.num_columns; i++) {
+                        if (strcmp(statement.condition_column, table->schema.columns[i].name) == 0) {
+                            if (table->schema.columns[i].type == COLUMN_TYPE_INT) {
+                                int column_value = *((int*)row.columns[i]);
+                                int condition_value = atoi(statement.condition_value);
+                                if (strcmp(statement.condition_operator, "=") == 0 && column_value != condition_value) {
+                                    condition_met = false;
+                                } else if (strcmp(statement.condition_operator, "<") == 0 && column_value >= condition_value) {
+                                    condition_met = false;
+                                } else if (strcmp(statement.condition_operator, ">") == 0 && column_value <= condition_value) {
+                                    condition_met = false;
+                                }
+                                // Add more operators as needed
+                            }
+                            // Add conditions for other types (DOUBLE, TEXT) as needed
                         }
                     }
-                    if (col_index == -1) {
-                        continue;
-                    }
-                    switch (table->schema.columns[col_index].type) {
-                        case COLUMN_TYPE_INT:
-                            snprintf(buffer, sizeof(buffer), "%d", *((int *)row.columns[col_index]));
-                            break;
-                        case COLUMN_TYPE_DOUBLE:
-                            snprintf(buffer, sizeof(buffer), "%.2f", *((double *)row.columns[col_index]));
-                            break;
-                        case COLUMN_TYPE_TEXT:
-                            snprintf(buffer, sizeof(buffer), "%s", row.columns[col_index]);
-                            break;
-                    }
-                    gtk_list_store_set(result_store, &tree_iter, i, buffer, -1);
                 }
+
+                if (condition_met) {
+                    gtk_list_store_append(result_store, &tree_iter);
+                    for (int i = 0; i < num_columns; i++) {
+                        char buffer[256];
+                        const char* col_name = statement.num_columns > 0 ? statement.columns[i].name : table->schema.columns[i].name;
+                        int col_index = -1;
+                        for (int j = 0; j < table->schema.num_columns; j++) {
+                            if (strcmp(col_name, table->schema.columns[j].name) == 0) {
+                                col_index = j;
+                                break;
+                            }
+                        }
+                        if (col_index == -1) {
+                            continue;
+                        }
+                        switch (table->schema.columns[col_index].type) {
+                            case COLUMN_TYPE_INT:
+                                snprintf(buffer, sizeof(buffer), "%d", *((int *)row.columns[col_index]));
+                                break;
+                            case COLUMN_TYPE_DOUBLE:
+                                snprintf(buffer, sizeof(buffer), "%.2f", *((double *)row.columns[col_index]));
+                                break;
+                            case COLUMN_TYPE_TEXT:
+                                snprintf(buffer, sizeof(buffer), "%s", row.columns[col_index]);
+                                break;
+                        }
+                        gtk_list_store_set(result_store, &tree_iter, i, buffer, -1);
+                    }
+                }
+
                 cursor_advance(cursor);
             }
             free(cursor);
@@ -2089,7 +2168,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             break;
     }
 }
-
 
 
 int main(int argc, char *argv[]) {
