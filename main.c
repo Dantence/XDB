@@ -117,21 +117,6 @@ ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
     return i;
 }
 
-// 读取输入
-void read_input(InputBuffer* input_buffer) {
-    ssize_t bytes_read =
-            getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
-
-    if (bytes_read <= 0) {
-        printf("Error reading input\n");
-        exit(EXIT_FAILURE);
-    }
-
-    // Ignore trailing newline
-    input_buffer->input_length = bytes_read - 1;
-    input_buffer->buffer[bytes_read - 1] = 0;
-}
-
 // 关闭input_buffer
 void close_input_buffer(InputBuffer* input_buffer) {
     free(input_buffer->buffer);
@@ -1202,11 +1187,16 @@ PrepareResult prepare_create_table(InputBuffer* input_buffer, Statement* stateme
     return PREPARE_SUCCESS;
 }
 
-
-
-
-
 PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement, Database* db) {
+    // 确保所有非元命令以分号结束
+    if (input_buffer->buffer[input_buffer->input_length - 1] != ';') {
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    // 移除分号，以便后续解析
+    input_buffer->buffer[input_buffer->input_length - 1] = '\0';
+    input_buffer->input_length--;
+
     if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
         return prepare_insert(input_buffer, statement, db);
     }
@@ -1266,7 +1256,6 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement,
 
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
-
 
 
 // 打开数据库文件并跟踪其大小，页面缓存初始化为NULL
@@ -1539,7 +1528,8 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     gtk_text_buffer_insert(output_buffer_widget, &output_iter, input_text, -1);
     gtk_text_buffer_insert(output_buffer_widget, &output_iter, "\n", -1);
 
-    gtk_text_buffer_set_text(buffer, "", -1);
+    // 不立即清除输入框
+    // gtk_text_buffer_set_text(buffer, "", -1);
 
     g_free(input_text);
 
@@ -1551,6 +1541,8 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             case (META_COMMAND_SUCCESS):
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Meta-command executed successfully.\n", -1);
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+                // 成功执行后清除输入框
+                gtk_text_buffer_set_text(buffer, "", -1);
                 return;
             case (META_COMMAND_UNRECOGNIZED_COMMAND):
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Unrecognized command.\n", -1);
@@ -1645,6 +1637,8 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
         case EXECUTE_SUCCESS:
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Executed.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            // 成功执行后清除输入框
+            gtk_text_buffer_set_text(buffer, "", -1);
             break;
         case EXECUTE_TABLE_FULL:
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Table full.\n", -1);
@@ -1660,6 +1654,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             break;
     }
 }
+
 
 
 
