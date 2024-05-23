@@ -1352,6 +1352,17 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     input_buffer->buffer[input_buffer->buffer_length - 1] = '\0'; // 确保字符串以null结尾
     input_buffer->input_length = strlen(input_text);
 
+    // 添加用户输入到输出框
+    GtkTextBuffer *output_buffer_widget = gtk_text_view_get_buffer(GTK_TEXT_VIEW(output_text_view));
+    GtkTextIter output_iter;
+    gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
+    gtk_text_buffer_insert(output_buffer_widget, &output_iter, "db > ", -1);
+    gtk_text_buffer_insert(output_buffer_widget, &output_iter, input_text, -1);
+    gtk_text_buffer_insert(output_buffer_widget, &output_iter, "\n", -1);
+
+    // 清空用户输入框
+    gtk_text_buffer_set_text(buffer, "", -1);
+
     g_free(input_text); // 释放临时分配的内存
 
     // 清空输出缓冲区
@@ -1359,10 +1370,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     output_buffer_pos = 0;
 
     // 处理输入
-    GtkTextBuffer *output_buffer_widget = gtk_text_view_get_buffer(GTK_TEXT_VIEW(output_text_view));
-    GtkTextIter output_iter;
-    gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
-
     if (input_buffer->buffer[0] == '.') {
         switch (do_meta_command(input_buffer, db, db_file)) {
             case (META_COMMAND_SUCCESS):
@@ -1417,6 +1424,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             break;
     }
 }
+
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
