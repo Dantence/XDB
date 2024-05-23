@@ -182,7 +182,8 @@ typedef enum {
     STATEMENT_UPDATE,
     STATEMENT_DELETE,
     STATEMENT_CREATE_TABLE,
-    STATEMENT_SHOW_TABLES
+    STATEMENT_SHOW_TABLES,
+    STATEMENT_DESC_TABLE
 } StatementType;
 
 // SQL语句
@@ -1405,6 +1406,12 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement,
         return PREPARE_SUCCESS;
     }
 
+    if (strncmp(input_buffer->buffer, "desc ", 5) == 0) {
+        statement->type = STATEMENT_DESC_TABLE;
+        strcpy(statement->table_name, input_buffer->buffer + 5);
+        return PREPARE_SUCCESS;
+    }
+
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
@@ -1659,6 +1666,32 @@ ExecuteResult execute_delete(Statement* statement, Database* db) {
     return EXECUTE_SUCCESS;
 }
 
+ExecuteResult execute_desc_table(Statement* statement, Database* db) {
+    Table* table = find_table(db, statement->table_name);
+    if (!table) {
+        return EXECUTE_TABLE_NOT_FOUND;
+    }
+
+    append_to_output_buffer("Table: %s\n", table->schema.name);
+    append_to_output_buffer("Columns:\n");
+    for (int i = 0; i < table->schema.num_columns; i++) {
+        char* type_str;
+        switch (table->schema.columns[i].type) {
+            case COLUMN_TYPE_INT:
+                type_str = "int";
+            break;
+            case COLUMN_TYPE_DOUBLE:
+                type_str = "double";
+            break;
+            case COLUMN_TYPE_TEXT:
+                type_str = "text";
+            break;
+        }
+        append_to_output_buffer("  %s: %s\n", table->schema.columns[i].name, type_str);
+    }
+    return EXECUTE_SUCCESS;
+}
+
 
 ExecuteResult execute_statement(Statement* statement, Database* db) {
     switch (statement->type) {
@@ -1674,6 +1707,8 @@ ExecuteResult execute_statement(Statement* statement, Database* db) {
             return execute_create_table(statement, db);
         case (STATEMENT_SHOW_TABLES):
             return execute_show_tables(db);
+        case (STATEMENT_DESC_TABLE):
+            return execute_desc_table(statement, db);
         default:
             return EXECUTE_FAILURE;
     }
@@ -1780,9 +1815,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     gtk_text_buffer_insert(output_buffer_widget, &output_iter, input_text, -1);
     gtk_text_buffer_insert(output_buffer_widget, &output_iter, "\n", -1);
 
-    // 不立即清除输入框
-    // gtk_text_buffer_set_text(buffer, "", -1);
-
     g_free(input_text);
 
     memset(output_buffer, 0, OUTPUT_BUFFER_SIZE);
@@ -1793,7 +1825,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             case (META_COMMAND_SUCCESS):
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Meta-command executed successfully.\n", -1);
                 gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
-                // 成功执行后清除输入框
                 gtk_text_buffer_set_text(buffer, "", -1);
                 return;
             case (META_COMMAND_UNRECOGNIZED_COMMAND):
@@ -1827,6 +1858,7 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
 
     ExecuteResult result = execute_statement(&statement, db);
     if (statement.type == STATEMENT_SELECT && result == EXECUTE_SUCCESS) {
+        // 清空旧的列
         GList *columns = gtk_tree_view_get_columns(GTK_TREE_VIEW(result_view));
         for (GList *iter = columns; iter != NULL; iter = iter->next) {
             gtk_tree_view_remove_column(GTK_TREE_VIEW(result_view), GTK_TREE_VIEW_COLUMN(iter->data));
@@ -1889,7 +1921,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
         case EXECUTE_SUCCESS:
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Executed.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
-            // 成功执行后清除输入框
             gtk_text_buffer_set_text(buffer, "", -1);
             break;
         case EXECUTE_TABLE_FULL:
@@ -1906,8 +1937,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             break;
     }
 }
-
-
 
 
 
