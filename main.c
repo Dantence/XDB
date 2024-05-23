@@ -11,6 +11,7 @@
 #include <string.h>
 #include <errno.h>
 
+#define MAX_TABLE_NAME_LENGTH 64
 #define TABLE_MAX_PAGES 100
 #define TABLE_MAX_COLS 10
 #define INVALID_PAGE_NUM UINT32_MAX
@@ -182,6 +183,7 @@ typedef enum {
     STATEMENT_UPDATE,
     STATEMENT_DELETE,
     STATEMENT_CREATE_TABLE,
+    STATEMENT_DROP_TABLE,
     STATEMENT_SHOW_TABLES,
     STATEMENT_DESC_TABLE
 } StatementType;
@@ -1401,6 +1403,19 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement,
         return prepare_create_table(input_buffer, statement);
     }
 
+    if (strncmp(input_buffer->buffer, "drop table", 10) == 0) {
+        statement->type = STATEMENT_DROP_TABLE;
+        char* keyword = strtok(input_buffer->buffer, " ");
+        keyword = strtok(NULL, " ");
+        char* table_name = strtok(NULL, " ");
+        if (table_name == NULL) {
+            return PREPARE_SYNTAX_ERROR;
+        }
+        strncpy(statement->table_name, table_name, sizeof(statement->table_name) - 1);
+        return PREPARE_SUCCESS;
+    }
+
+
     if (strcmp(input_buffer->buffer, "show tables") == 0) {
         statement->type = STATEMENT_SHOW_TABLES;
         return PREPARE_SUCCESS;
@@ -1484,6 +1499,58 @@ ExecuteResult execute_create_table(Statement* statement, Database* db) {
     db->tables[db->table_count] = table; // 直接存储表指针
 
     db->table_count++;
+    return EXECUTE_SUCCESS;
+}
+
+void free_table(Table* table) {
+    // 释放Pager中的每一页
+    for (uint32_t i = 0; i < table->pager->num_pages; i++) {
+        if (table->pager->pages[i] != NULL) {
+            free(table->pager->pages[i]);
+            table->pager->pages[i] = NULL;
+        }
+    }
+    // 关闭文件描述符
+    close(table->pager->file_descriptor);
+    // 释放Pager结构
+    free(table->pager);
+
+    // 释放表结构本身
+    free(table);
+}
+
+
+
+void drop_table(Database* db, const char* table_name) {
+    for (int i = 0; i < db->table_count; i++) {
+        if (strcmp(db->tables[i]->schema.name, table_name) == 0) {
+            free_table(db->tables[i]);
+            for (int j = i; j < db->table_count - 1; j++) {
+                db->tables[j] = db->tables[j + 1];
+            }
+            db->tables[db->table_count - 1] = NULL;
+            db->table_count--;
+            return;
+        }
+    }
+}
+
+
+
+ExecuteResult execute_drop_table(Statement* statement, Database* db) {
+    Table* table = NULL;
+    for (int i = 0; i < db->table_count; i++) {
+        if (strcmp(db->tables[i]->schema.name, statement->table_name) == 0) {
+            table = db->tables[i];
+            break;
+        }
+    }
+
+    if (table == NULL) {
+        return EXECUTE_TABLE_NOT_FOUND;
+    }
+
+    drop_table(db, statement->table_name);
     return EXECUTE_SUCCESS;
 }
 
@@ -1705,6 +1772,8 @@ ExecuteResult execute_statement(Statement* statement, Database* db) {
             return execute_delete(statement, db);
         case (STATEMENT_CREATE_TABLE):
             return execute_create_table(statement, db);
+        case (STATEMENT_DROP_TABLE):
+            return execute_drop_table(statement, db);
         case (STATEMENT_SHOW_TABLES):
             return execute_show_tables(db);
         case (STATEMENT_DESC_TABLE):
