@@ -1332,14 +1332,14 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db, const
 }
 
 void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
-
-    // 从data中获取text_view、database和input_buffer
     GtkWidget **widgets = (GtkWidget **)data;
     GtkWidget *text_view = widgets[0];
     Database *db = (Database *)widgets[1];
     InputBuffer *input_buffer = (InputBuffer *)widgets[2];
     GtkWidget *output_text_view = widgets[3];
-    const char* db_file = (const char*)widgets[4]; // 获取db_file
+    const char *db_file = (const char *)widgets[4];
+    GtkWidget *result_view = widgets[5];
+    GtkListStore *result_store = GTK_LIST_STORE(widgets[6]);
 
     GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(text_view));
     GtkTextIter start, end;
@@ -1348,11 +1348,10 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
 
     gchar *input_text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
 
-    strncpy(input_buffer->buffer, input_text, input_buffer->buffer_length - 1); // 避免缓冲区溢出
-    input_buffer->buffer[input_buffer->buffer_length - 1] = '\0'; // 确保字符串以null结尾
+    strncpy(input_buffer->buffer, input_text, input_buffer->buffer_length - 1);
+    input_buffer->buffer[input_buffer->buffer_length - 1] = '\0';
     input_buffer->input_length = strlen(input_text);
 
-    // 添加用户输入到输出框
     GtkTextBuffer *output_buffer_widget = gtk_text_view_get_buffer(GTK_TEXT_VIEW(output_text_view));
     GtkTextIter output_iter;
     gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
@@ -1360,16 +1359,13 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     gtk_text_buffer_insert(output_buffer_widget, &output_iter, input_text, -1);
     gtk_text_buffer_insert(output_buffer_widget, &output_iter, "\n", -1);
 
-    // 清空用户输入框
     gtk_text_buffer_set_text(buffer, "", -1);
 
-    g_free(input_text); // 释放临时分配的内存
+    g_free(input_text);
 
-    // 清空输出缓冲区
     memset(output_buffer, 0, OUTPUT_BUFFER_SIZE);
     output_buffer_pos = 0;
 
-    // 处理输入
     if (input_buffer->buffer[0] == '.') {
         switch (do_meta_command(input_buffer, db, db_file)) {
             case (META_COMMAND_SUCCESS):
@@ -1405,24 +1401,73 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             return;
     }
 
-    switch (execute_statement(&statement, db)) {
-        case (EXECUTE_SUCCESS):
+    ExecuteResult result = execute_statement(&statement, db);
+    if (statement.type == STATEMENT_SELECT && result == EXECUTE_SUCCESS) {
+        GList *columns = gtk_tree_view_get_columns(GTK_TREE_VIEW(result_view));
+        for (GList *iter = columns; iter != NULL; iter = iter->next) {
+            gtk_tree_view_remove_column(GTK_TREE_VIEW(result_view), GTK_TREE_VIEW_COLUMN(iter->data));
+        }
+        g_list_free(columns);
+
+        Table *table = find_table(db, statement.table_name);
+        if (table) {
+            int num_columns = table->schema.num_columns;
+            GtkTreeIter tree_iter;
+            GType *types = g_new0(GType, num_columns);
+            for (int i = 0; i < num_columns; i++) {
+                types[i] = G_TYPE_STRING;
+                GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
+                GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(table->schema.columns[i].name, renderer, "text", i, NULL);
+                gtk_tree_view_append_column(GTK_TREE_VIEW(result_view), col);
+            }
+            result_store = gtk_list_store_newv(num_columns, types);
+            g_free(types);
+
+            Cursor *cursor = table_start(table);
+            Row row;
+            while (!(cursor->end_of_table)) {
+                deserialize_row(cursor_value(cursor), &row, &table->schema);
+                gtk_list_store_append(result_store, &tree_iter);
+                for (int i = 0; i < num_columns; i++) {
+                    char buffer[256];
+                    switch (table->schema.columns[i].type) {
+                        case COLUMN_TYPE_INT:
+                            snprintf(buffer, sizeof(buffer), "%d", *((int *)row.columns[i]));
+                            break;
+                        case COLUMN_TYPE_DOUBLE:
+                            snprintf(buffer, sizeof(buffer), "%.2f", *((double *)row.columns[i]));
+                            break;
+                        case COLUMN_TYPE_TEXT:
+                            snprintf(buffer, sizeof(buffer), "%s", row.columns[i]);
+                            break;
+                    }
+                    gtk_list_store_set(result_store, &tree_iter, i, buffer, -1);
+                }
+                cursor_advance(cursor);
+            }
+            free(cursor);
+            gtk_tree_view_set_model(GTK_TREE_VIEW(result_view), GTK_TREE_MODEL(result_store));
+        }
+    }
+    switch (result) {
+        case EXECUTE_SUCCESS:
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Executed.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
             break;
-        case (EXECUTE_TABLE_FULL):
+        case EXECUTE_TABLE_FULL:
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Table full.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
             break;
-        case (EXECUTE_DUPLICATE_KEY):
+        case EXECUTE_DUPLICATE_KEY:
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Duplicate key.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
             break;
-        case (EXECUTE_TABLE_NOT_FOUND):
+        case EXECUTE_TABLE_NOT_FOUND:
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Table not found.\n", -1);
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
             break;
     }
+
 }
 
 
@@ -1446,7 +1491,12 @@ int main(int argc, char *argv[]) {
     GtkWidget *execute_button;
     GtkWidget *output_scroll_window;
     GtkWidget *output_text_view;
-    GtkWidget *widgets[5]; // 用于传递text_view、table、input_buffer、output_text_view和db_file
+    GtkWidget *widgets[7]; // 用于传递text_view、table、input_buffer、output_text_view和db_file
+    GtkWidget *result_view;
+    GtkListStore *result_store;
+    GtkTreeViewColumn *col;
+    GtkCellRenderer *renderer;
+    GtkWidget *scroll_result_window;
 
     gtk_init(&argc, &argv);
 
@@ -1479,6 +1529,18 @@ int main(int argc, char *argv[]) {
     gtk_text_view_set_editable(GTK_TEXT_VIEW(output_text_view), FALSE); // 使其不可编辑
     gtk_container_add(GTK_CONTAINER(output_scroll_window), output_text_view);
 
+    // 定义result_view
+    scroll_result_window = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_result_window), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    gtk_box_pack_start(GTK_BOX(vbox), scroll_result_window, TRUE, TRUE, 0);
+
+    result_store = gtk_list_store_new(1, G_TYPE_STRING); // 最初设置为 1 列，稍后会根据查询结果动态更新列数
+    result_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(result_store));
+    gtk_container_add(GTK_CONTAINER(scroll_result_window), result_view);
+    renderer = gtk_cell_renderer_text_new();
+    col = gtk_tree_view_column_new_with_attributes("Column 1", renderer, "text", 0, NULL);
+    gtk_tree_view_append_column(GTK_TREE_VIEW(result_view), col);
+
     // 设置字体
     PangoFontDescription *font_desc = pango_font_description_from_string("Monospace 12");
     gtk_widget_override_font(text_view, font_desc);
@@ -1492,6 +1554,8 @@ int main(int argc, char *argv[]) {
     widgets[2] = (GtkWidget *)input_buffer;
     widgets[3] = output_text_view;
     widgets[4] = (GtkWidget *)db_file; // 添加db_file
+    widgets[5] = result_view;
+    widgets[6] = (GtkWidget *)result_store;
 
     g_signal_connect(execute_button, "clicked", G_CALLBACK(on_execute_button_clicked), widgets);
     // 连接回车键事件
