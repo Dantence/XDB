@@ -1101,14 +1101,45 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement,
 
     if (strncmp(input_buffer->buffer, "select", 6) == 0) {
         statement->type = STATEMENT_SELECT;
-        char* keyword = strtok(input_buffer->buffer, " ");
-        char* table_name = strtok(NULL, " ");
+        char* buffer = strdup(input_buffer->buffer);
+        char* keyword = strtok(buffer, " "); // SELECT
+        char* remaining_str = buffer + strlen(keyword) + 1; // Remaining string after SELECT
 
-        if (table_name == NULL) {
+        // Find the position of "FROM"
+        char* from_pos = strstr(remaining_str, " from ");
+        if (from_pos == NULL) {
+            free(buffer);
             return PREPARE_SYNTAX_ERROR;
         }
 
+        // Extract columns part and table name part
+        size_t columns_length = from_pos - remaining_str;
+        char* columns_str = (char*)malloc(columns_length + 1);
+        strncpy(columns_str, remaining_str, columns_length);
+        columns_str[columns_length] = '\0';
+
+        char* table_name = from_pos + strlen(" from ");
+        if (table_name == NULL) {
+            free(buffer);
+            free(columns_str);
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        if (strcmp(columns_str, "*") == 0) {
+            statement->num_columns = 0; // Select all columns
+        } else {
+            char* col = strtok(columns_str, ",");
+            while (col != NULL) {
+                while (*col == ' ') col++; // Skip leading spaces
+                strncpy(statement->columns[statement->num_columns].name, col, 32);
+                statement->num_columns++;
+                col = strtok(NULL, ",");
+            }
+        }
+
         strcpy(statement->table_name, table_name);
+        free(buffer);
+        free(columns_str);
         return PREPARE_SUCCESS;
     }
 
@@ -1123,6 +1154,8 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement,
 
     return PREPARE_UNRECOGNIZED_STATEMENT;
 }
+
+
 
 // 打开数据库文件并跟踪其大小，页面缓存初始化为NULL
 Pager* pager_open(const char* filename) {
@@ -1236,12 +1269,47 @@ ExecuteResult execute_select(Statement* statement, Database* db) {
     Row row;
     while (!(cursor->end_of_table)) {
         deserialize_row(cursor_value(cursor), &row, &table->schema);
-        print_row(&row, &table->schema);
+
+        if (statement->num_columns == 0) {
+            // Select all columns
+            print_row(&row, &table->schema);
+        } else {
+            // Select specific columns
+            char buffer[1024];
+            int offset = snprintf(buffer, sizeof(buffer), "(%d", row.id);
+
+            for (int i = 0; i < statement->num_columns; i++) {
+                for (int j = 0; j < table->schema.num_columns; j++) {
+                    if (strcmp(statement->columns[i].name, table->schema.columns[j].name) == 0) {
+                        switch (table->schema.columns[j].type) {
+                            case COLUMN_TYPE_INT:
+                                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %d", *((int*)row.columns[j]));
+                                break;
+                            case COLUMN_TYPE_DOUBLE:
+                                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %.2f", *((double*)row.columns[j]));
+                                break;
+                            case COLUMN_TYPE_TEXT:
+                                if (!g_utf8_validate(row.columns[j], -1, NULL)) {
+                                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", "<Invalid UTF-8>");
+                                } else {
+                                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", row.columns[j]);
+                                }
+                                break;
+                        }
+                    }
+                }
+            }
+
+            snprintf(buffer + offset, sizeof(buffer) - offset, ")\n");
+            append_to_output_buffer("%s", buffer);
+        }
+
         cursor_advance(cursor);
     }
     free(cursor);
     return EXECUTE_SUCCESS;
 }
+
 
 ExecuteResult execute_statement(Statement* statement, Database* db) {
     switch (statement->type) {
@@ -1411,13 +1479,14 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
 
         Table *table = find_table(db, statement.table_name);
         if (table) {
-            int num_columns = table->schema.num_columns;
+            int num_columns = statement.num_columns > 0 ? statement.num_columns : table->schema.num_columns;
             GtkTreeIter tree_iter;
             GType *types = g_new0(GType, num_columns);
             for (int i = 0; i < num_columns; i++) {
                 types[i] = G_TYPE_STRING;
                 GtkCellRenderer *renderer = gtk_cell_renderer_text_new();
-                GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(table->schema.columns[i].name, renderer, "text", i, NULL);
+                const char* col_name = statement.num_columns > 0 ? statement.columns[i].name : table->schema.columns[i].name;
+                GtkTreeViewColumn *col = gtk_tree_view_column_new_with_attributes(col_name, renderer, "text", i, NULL);
                 gtk_tree_view_append_column(GTK_TREE_VIEW(result_view), col);
             }
             result_store = gtk_list_store_newv(num_columns, types);
@@ -1430,15 +1499,26 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
                 gtk_list_store_append(result_store, &tree_iter);
                 for (int i = 0; i < num_columns; i++) {
                     char buffer[256];
-                    switch (table->schema.columns[i].type) {
+                    const char* col_name = statement.num_columns > 0 ? statement.columns[i].name : table->schema.columns[i].name;
+                    int col_index = -1;
+                    for (int j = 0; j < table->schema.num_columns; j++) {
+                        if (strcmp(col_name, table->schema.columns[j].name) == 0) {
+                            col_index = j;
+                            break;
+                        }
+                    }
+                    if (col_index == -1) {
+                        continue;
+                    }
+                    switch (table->schema.columns[col_index].type) {
                         case COLUMN_TYPE_INT:
-                            snprintf(buffer, sizeof(buffer), "%d", *((int *)row.columns[i]));
+                            snprintf(buffer, sizeof(buffer), "%d", *((int *)row.columns[col_index]));
                             break;
                         case COLUMN_TYPE_DOUBLE:
-                            snprintf(buffer, sizeof(buffer), "%.2f", *((double *)row.columns[i]));
+                            snprintf(buffer, sizeof(buffer), "%.2f", *((double *)row.columns[col_index]));
                             break;
                         case COLUMN_TYPE_TEXT:
-                            snprintf(buffer, sizeof(buffer), "%s", row.columns[i]);
+                            snprintf(buffer, sizeof(buffer), "%s", row.columns[col_index]);
                             break;
                     }
                     gtk_list_store_set(result_store, &tree_iter, i, buffer, -1);
@@ -1467,8 +1547,9 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
             gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
             break;
     }
-
 }
+
+
 
 
 int main(int argc, char *argv[]) {
