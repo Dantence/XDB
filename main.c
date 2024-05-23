@@ -176,13 +176,9 @@ typedef struct {
     TableSchema schema; // 新增：表架构
 } Table;
 
-typedef struct {
-    char name[32];  // 表名
-    Table* table;   // 表对应的数据结构
-} TableInfo;
 
 typedef struct {
-    TableInfo tables[100]; // 最多支持100张表
+    Table* tables[100]; // 最多支持100张表
     int table_count;
 } Database;
 
@@ -543,7 +539,7 @@ void pager_flush(Pager* pager, uint32_t page_num) {
     }
 }
 
-void db_close(Table* table) {
+void table_close(Table* table) {
     Pager* pager = table->pager;
     // 释放缓存
     for (uint32_t i = 0; i < pager->num_pages; i++) {
@@ -628,19 +624,19 @@ void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level, Tab
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db) {
     if (strcmp(input_buffer->buffer, ".exit") == 0) {
         for (int i = 0; i < db->table_count; i++) {
-            db_close(db->tables[i].table);
+            table_close(db->tables[i]);
         }
         exit(EXIT_SUCCESS);
     } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
         printf("Constants:\n");
         for (int i = 0; i < db->table_count; i++) {
-            print_constants(&db->tables[i].table->schema);
+            print_constants(&db->tables[i]->schema);
         }
         return META_COMMAND_SUCCESS;
     } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
         for (int i = 0; i < db->table_count; i++) {
-            printf("Table: %s\n", db->tables[i].name);
-            print_tree(db->tables[i].table->pager, 0, 0, &db->tables[i].table->schema);
+            printf("Table: %s\n", db->tables[i]->schema.name);
+            print_tree(db->tables[i]->pager, 0, 0, &db->tables[i]->schema);
         }
         return META_COMMAND_SUCCESS;
     } else {
@@ -999,8 +995,8 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
 
 Table* find_table(Database* db, const char* table_name) {
     for (int i = 0; i < db->table_count; i++) {
-        if (strcmp(db->tables[i].name, table_name) == 0) {
-            return db->tables[i].table;
+        if (strcmp(db->tables[i]->schema.name, table_name) == 0) {
+            return db->tables[i];
         }
     }
     return NULL;
@@ -1186,7 +1182,7 @@ Pager* pager_open(const char* filename) {
 }
 
 // 创建表
-Table* db_open(const char* filename, TableSchema* schema) {
+Table* table_open(const char* filename, TableSchema* schema) {
     Pager* pager = pager_open(filename);
     Table* table = (Table*)malloc(sizeof(Table));
     table->pager = pager;
@@ -1206,21 +1202,19 @@ ExecuteResult execute_create_table(Statement* statement, Database* db) {
     }
 
     TableSchema schema;
-    strcpy(schema.name, statement->table_name);
+    strcpy(schema.name, statement->table_name); // 设置表架构中的表名
     schema.num_columns = statement->num_columns;
     for (int i = 0; i < statement->num_columns; i++) {
         schema.columns[i] = statement->columns[i];
     }
     calculate_table_constants(&schema);
 
-    Table* table = db_open(statement->table_name, &schema);
+    Table* table = table_open(statement->table_name, &schema);
     if (!table) {
         return EXECUTE_FAILURE;
     }
 
-    TableInfo* table_info = &db->tables[db->table_count];
-    strcpy(table_info->name, statement->table_name);
-    table_info->table = table;
+    db->tables[db->table_count] = table; // 直接存储表指针
 
     db->table_count++;
     return EXECUTE_SUCCESS;
@@ -1228,8 +1222,8 @@ ExecuteResult execute_create_table(Statement* statement, Database* db) {
 
 ExecuteResult execute_show_tables(Database* db) {
     for (int i = 0; i < db->table_count; i++) {
-        printf("%s\n", db->tables[i].name);
-        append_to_output_buffer("%s\n", db->tables[i].name);
+        printf("%s\n", db->tables[i]->schema.name);
+        append_to_output_buffer("%s\n", db->tables[i]->schema.name);
     }
     return EXECUTE_SUCCESS;
 }
@@ -1391,7 +1385,7 @@ int main(int argc, char *argv[]) {
         printf("Must supply a database filename.\n");
         exit(EXIT_FAILURE);
     }
-    char* filename = argv[1];
+    char* db_file = argv[1];
     Database db;
     db.table_count = 0;
 
