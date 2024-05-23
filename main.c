@@ -180,6 +180,7 @@ typedef enum {
     STATEMENT_INSERT,
     STATEMENT_SELECT,
     STATEMENT_UPDATE,
+    STATEMENT_DELETE,
     STATEMENT_CREATE_TABLE,
     STATEMENT_SHOW_TABLES
 } StatementType;
@@ -1266,6 +1267,46 @@ PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Da
     return PREPARE_SUCCESS;
 }
 
+PrepareResult prepare_delete(InputBuffer* input_buffer, Statement* statement, Database* db) {
+    statement->type = STATEMENT_DELETE;
+
+    char* buffer = strdup(input_buffer->buffer);
+    char* keyword = strtok(buffer, " "); // "delete"
+    char* from = strtok(NULL, " "); // "from"
+    char* table_name = strtok(NULL, " "); // table name
+
+    if (strcmp(from, "from") != 0 || table_name == NULL) {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    char* where = strtok(NULL, " "); // "where"
+    char* id_column = strtok(NULL, " "); // "id"
+    char* equals = strtok(NULL, " "); // "="
+    char* id_value = strtok(NULL, " "); // ID value
+
+    if (where == NULL || id_column == NULL || equals == NULL || id_value == NULL) {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    if (strcmp(where, "where") != 0 || strcmp(id_column, "id") != 0 || strcmp(equals, "=") != 0) {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    int id = atoi(id_value);
+    if (id < 0) {
+        free(buffer);
+        return PREPARE_NEGATIVE_ID;
+    }
+
+    statement->row_to_insert.id = id;
+    strcpy(statement->table_name, table_name);
+    free(buffer);
+    return PREPARE_SUCCESS;
+}
+
 
 PrepareResult prepare_create_table(InputBuffer* input_buffer, Statement* statement) {
     statement->type = STATEMENT_CREATE_TABLE;
@@ -1349,6 +1390,10 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement,
 
     if (strncmp(input_buffer->buffer, "update", 6) == 0) {
         return prepare_update(input_buffer, statement, db);
+    }
+
+    if (strncmp(input_buffer->buffer, "delete", 6) == 0) {
+        return prepare_delete(input_buffer, statement, db);
     }
 
     if (strncmp(input_buffer->buffer, "create table", 12) == 0) {
@@ -1568,6 +1613,52 @@ ExecuteResult execute_update(Statement* statement, Database* db) {
     return EXECUTE_SUCCESS;
 }
 
+ExecuteResult execute_delete(Statement* statement, Database* db) {
+    Table* table = find_table(db, statement->table_name);
+    if (!table) {
+        return EXECUTE_TABLE_NOT_FOUND;
+    }
+
+    uint32_t target_id = statement->row_to_insert.id;
+    Cursor* cursor = table_find(table, target_id);
+
+    void* node = get_page(table->pager, cursor->page_num);
+    uint32_t num_cells = *leaf_node_num_cells(node);
+
+    // 查找目标节点
+    bool found = false;
+    for (uint32_t i = 0; i < num_cells; i++) {
+        uint32_t key = *leaf_node_key(node, i, &table->schema);
+        if (key == target_id) {
+            found = true;
+            // 删除目标节点
+            for (uint32_t j = i; j < num_cells - 1; j++) {
+                void* destination = leaf_node_cell(node, j, &table->schema);
+                void* source = leaf_node_cell(node, j + 1, &table->schema);
+                memcpy(destination, source, table->schema.leaf_node_cell_size);
+            }
+            (*leaf_node_num_cells(node)) -= 1;
+
+            // 更新B树
+            if (cursor->page_num != table->root_page_num) {
+                uint32_t new_max = get_node_max_key(table->pager, node, &table->schema);
+                void* parent = get_page(table->pager, *node_parent(node));
+                update_internal_node_key(parent, target_id, new_max);
+            }
+
+            break;
+        }
+    }
+
+    free(cursor);
+
+    if (!found) {
+        return EXECUTE_FAILURE;
+    }
+
+    return EXECUTE_SUCCESS;
+}
+
 
 ExecuteResult execute_statement(Statement* statement, Database* db) {
     switch (statement->type) {
@@ -1577,6 +1668,8 @@ ExecuteResult execute_statement(Statement* statement, Database* db) {
             return execute_select(statement, db);
         case (STATEMENT_UPDATE):
             return execute_update(statement, db);
+        case (STATEMENT_DELETE):
+            return execute_delete(statement, db);
         case (STATEMENT_CREATE_TABLE):
             return execute_create_table(statement, db);
         case (STATEMENT_SHOW_TABLES):
