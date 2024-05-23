@@ -215,17 +215,29 @@ void print_row(Row* row, TableSchema* schema) {
     for (int i = 1; i < schema->num_columns; i++) {  // 从 0 开始
         switch (schema->columns[i].type) {
             case COLUMN_TYPE_INT:
-                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %d", *((int*)row->columns[i]));
+                if (row->columns[i] != NULL) {
+                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %d", *((int*)row->columns[i]));
+                } else {
+                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", NULL");
+                }
             break;
             case COLUMN_TYPE_DOUBLE:
-                offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %.2f", *((double*)row->columns[i]));
+                if (row->columns[i] != NULL) {
+                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %.2f", *((double*)row->columns[i]));
+                } else {
+                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", NULL");
+                }
             break;
             case COLUMN_TYPE_TEXT:
-                if (!g_utf8_validate(row->columns[i], -1, NULL)) {
-                    // 如果字符串无效，则替换为有效的指示字符串
-                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", "<Invalid UTF-8>");
+                if (row->columns[i] != NULL) {
+                    if (!g_utf8_validate(row->columns[i], -1, NULL)) {
+                        // 如果字符串无效，则替换为有效的指示字符串
+                        offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", "<Invalid UTF-8>");
+                    } else {
+                        offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", row->columns[i]);
+                    }
                 } else {
-                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", %s", row->columns[i]);
+                    offset += snprintf(buffer + offset, sizeof(buffer) - offset, ", NULL");
                 }
             break;
         }
@@ -236,6 +248,7 @@ void print_row(Row* row, TableSchema* schema) {
     // 将结果追加到输出缓冲区
     append_to_output_buffer("%s", buffer);
 }
+
 
 
 // 打印提示符
@@ -435,20 +448,37 @@ void serialize_row(Row* source, void* destination, TableSchema* schema) {
     for (int i = 0; i < schema->num_columns; i++) {
         switch (schema->columns[i].type) {
             case COLUMN_TYPE_INT:
-                memcpy(destination + offset, source->columns[i], sizeof(int));
-                offset += sizeof(int);
-                break;
+                if (source->columns[i] != NULL) {
+                    memcpy(destination + offset, source->columns[i], sizeof(int));
+                } else {
+                    int default_int = 0;
+                    memcpy(destination + offset, &default_int, sizeof(int));
+                }
+            offset += sizeof(int);
+            break;
             case COLUMN_TYPE_DOUBLE:
-                memcpy(destination + offset, source->columns[i], sizeof(double));
-                offset += sizeof(double);
-                break;
+                if (source->columns[i] != NULL) {
+                    memcpy(destination + offset, source->columns[i], sizeof(double));
+                } else {
+                    double default_double = 0.0;
+                    memcpy(destination + offset, &default_double, sizeof(double));
+                }
+            offset += sizeof(double);
+            break;
             case COLUMN_TYPE_TEXT:
-                strcpy(destination + offset, source->columns[i]);
-                offset += strlen(source->columns[i]) + 1;
-                break;
+                if (source->columns[i] != NULL) {
+                    strcpy(destination + offset, source->columns[i]);
+                    offset += strlen(source->columns[i]) + 1;
+                } else {
+                    char default_text = '\0';
+                    memcpy(destination + offset, &default_text, 1);
+                    offset += 1;
+                }
+            break;
         }
     }
 }
+
 
 void deserialize_row(void* source, Row* destination, TableSchema* schema) {
     memcpy(&(destination->id), source, sizeof(uint32_t));
@@ -472,6 +502,7 @@ void deserialize_row(void* source, Row* destination, TableSchema* schema) {
         }
     }
 }
+
 
 
 // 获取页面
@@ -981,52 +1012,133 @@ Table* find_table(Database* db, const char* table_name) {
 PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement, Database* db) {
     statement->type = STATEMENT_INSERT;
 
-    char* keyword = strtok(input_buffer->buffer, " ");
+    char* buffer = strdup(input_buffer->buffer);
+    char* keyword = strtok(buffer, " ");
+    char* into = strtok(NULL, " ");
     char* table_name = strtok(NULL, " ");
 
-    if (table_name == NULL) {
+    if (strcmp(into, "into") != 0 || table_name == NULL) {
+        free(buffer);
         return PREPARE_SYNTAX_ERROR;
     }
 
     Table* table = find_table(db, table_name);
     if (table == NULL) {
+        free(buffer);
         return PREPARE_TABLE_NOT_FOUND;
     }
 
+    char* column_list_start = strstr(input_buffer->buffer, "(");
+    char* column_list_end = strstr(input_buffer->buffer, ")");
+    char* values_keyword = strstr(input_buffer->buffer, "values");
+    if (column_list_start == NULL || column_list_end == NULL || values_keyword == NULL) {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    if (values_keyword < column_list_end) {
+        free(buffer);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    // Extract and parse column list
+    size_t column_list_length = column_list_end - column_list_start - 1;
+    char* column_list = (char*)malloc(column_list_length + 1);
+    strncpy(column_list, column_list_start + 1, column_list_length);
+    column_list[column_list_length] = '\0';
+
+    // Extract and parse value list
+    char* value_list_start = strstr(values_keyword, "(");
+    char* value_list_end = strstr(values_keyword, ")");
+    if (value_list_start == NULL || value_list_end == NULL) {
+        free(buffer);
+        free(column_list);
+        return PREPARE_SYNTAX_ERROR;
+    }
+
+    size_t value_list_length = value_list_end - value_list_start - 1;
+    char* value_list = (char*)malloc(value_list_length + 1);
+    strncpy(value_list, value_list_start + 1, value_list_length);
+    value_list[value_list_length] = '\0';
+
+    // Parse columns
+    char* column = strtok(column_list, ",");
+    int column_indices[TABLE_MAX_COLS];
+    int column_count = 0;
+
+    while (column != NULL) {
+        // Trim leading whitespace
+        while (*column == ' ') column++;
+        // Validate and store column index
+        bool found = false;
+        for (int i = 0; i < table->schema.num_columns; i++) {
+            if (strcmp(column, table->schema.columns[i].name) == 0) {
+                found = true;
+                column_indices[column_count++] = i;
+                break;
+            }
+        }
+        if (!found) {
+            free(buffer);
+            free(column_list);
+            free(value_list);
+            return PREPARE_SYNTAX_ERROR;  // Invalid column name
+        }
+        column = strtok(NULL, ",");
+    }
+
+    // Initialize all columns to NULL or default values
     for (int i = 0; i < table->schema.num_columns; i++) {
-        char* column_value = strtok(NULL, " ");
-        if (column_value == NULL) {
-            return PREPARE_SYNTAX_ERROR;
-        }
+        statement->row_to_insert.columns[i] = NULL;
+    }
 
-        if (table->schema.columns[i].type == COLUMN_TYPE_TEXT && strlen(column_value) > 255) {
-            return PREPARE_STRING_TOO_LONG;
-        }
-
-        if (table->schema.columns[i].type == COLUMN_TYPE_INT) {
-            if(i == 0) {
-                int id = atoi(column_value);
+    // Parse values
+    char* value = strtok(value_list, ",");
+    int value_index = 0;
+    while (value != NULL && value_index < column_count) {
+        // Trim leading whitespace
+        while (*value == ' ') value++;
+        // Convert and store value
+        int col_index = column_indices[value_index];
+        if (table->schema.columns[col_index].type == COLUMN_TYPE_INT) {
+            if (col_index == 0) {
+                int id = atoi(value);
                 statement->row_to_insert.id = id;
-                if(id < 0) {
+                if (id < 0) {
+                    free(buffer);
+                    free(column_list);
+                    free(value_list);
                     return PREPARE_NEGATIVE_ID;
                 }
             }
             int* int_value = malloc(sizeof(int));
-            *int_value = atoi(column_value);
-            statement->row_to_insert.columns[i] = (char*)int_value;
-        } else if (table->schema.columns[i].type == COLUMN_TYPE_DOUBLE) {
+            *int_value = atoi(value);
+            statement->row_to_insert.columns[col_index] = (char*)int_value;
+        } else if (table->schema.columns[col_index].type == COLUMN_TYPE_DOUBLE) {
             double* double_value = malloc(sizeof(double));
-            *double_value = atof(column_value);
-            statement->row_to_insert.columns[i] = (char*)double_value;
-        } else if (table->schema.columns[i].type == COLUMN_TYPE_TEXT) {
-            statement->row_to_insert.columns[i] = strdup(column_value);
+            *double_value = atof(value);
+            statement->row_to_insert.columns[col_index] = (char*)double_value;
+        } else if (table->schema.columns[col_index].type == COLUMN_TYPE_TEXT) {
+            if (strlen(value) > 255) {
+                free(buffer);
+                free(column_list);
+                free(value_list);
+                return PREPARE_STRING_TOO_LONG;
+            }
+            statement->row_to_insert.columns[col_index] = strdup(value);
         }
+        value = strtok(NULL, ",");
+        value_index++;
     }
 
     strcpy(statement->table_name, table_name);
 
+    free(buffer);
+    free(column_list);
+    free(value_list);
     return PREPARE_SUCCESS;
 }
+
 
 PrepareResult prepare_create_table(InputBuffer* input_buffer, Statement* statement) {
     statement->type = STATEMENT_CREATE_TABLE;
