@@ -1617,6 +1617,22 @@ ExecuteResult execute_select(Statement* statement, Database* db) {
         return EXECUTE_TABLE_NOT_FOUND;
     }
 
+    if (statement->has_condition && strcmp(statement->condition_column, "id") == 0) {
+        uint32_t key = atoi(statement->condition_value);
+        Cursor* cursor = table_find(table, key);
+        if (cursor->end_of_table || *leaf_node_key(get_page(table->pager, cursor->page_num), cursor->cell_num, &table->schema) != key) {
+            // No matching row found
+            free(cursor);
+            return EXECUTE_SUCCESS;
+        }
+
+        Row row;
+        deserialize_row(cursor_value(cursor), &row, &table->schema);
+        print_row(&row, &table->schema);
+        free(cursor);
+        return EXECUTE_SUCCESS;
+    }
+
     Cursor* cursor = table_start(table);
     Row row;
     while (!(cursor->end_of_table)) {
@@ -1685,6 +1701,7 @@ ExecuteResult execute_select(Statement* statement, Database* db) {
     free(cursor);
     return EXECUTE_SUCCESS;
 }
+
 
 ExecuteResult execute_update(Statement* statement, Database* db) {
     Table* table = find_table(db, statement->table_name);
