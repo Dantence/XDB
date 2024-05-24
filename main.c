@@ -606,38 +606,47 @@ void indent(uint32_t level) {
 }
 
 // B树可视化
-void print_tree(Pager* pager, uint32_t page_num, uint32_t indentation_level, TableSchema* schema) {
+void print_tree_to_buffer(Pager* pager, uint32_t page_num, uint32_t indentation_level, TableSchema* schema, char* buffer, size_t buffer_size, size_t* buffer_pos) {
     void* node = get_page(pager, page_num);
     uint32_t num_keys, child;
 
     switch (get_node_type(node)) {
         case (NODE_LEAF):
             num_keys = *leaf_node_num_cells(node);
-        indent(indentation_level);
-        printf("- leaf (size %d)\n", num_keys);
-        for (uint32_t i = 0; i < num_keys; i++) {
-            indent(indentation_level + 1);
-            printf("- %d\n", *leaf_node_key(node, i, schema));
-        }
-        break;
+            for (uint32_t i = 0; i < indentation_level; i++) {
+                *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "  ");
+            }
+            *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "- leaf (size %d)\n", num_keys);
+            for (uint32_t i = 0; i < num_keys; i++) {
+                for (uint32_t j = 0; j < indentation_level + 1; j++) {
+                    *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "  ");
+                }
+                *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "- %d\n", *leaf_node_key(node, i, schema));
+            }
+            break;
         case (NODE_INTERNAL):
             num_keys = *internal_node_num_keys(node);
-        indent(indentation_level);
-        printf("- internal (size %d)\n", num_keys);
-        if (num_keys > 0) {
-            for (uint32_t i = 0; i < num_keys; i++) {
-                child = *internal_node_child(node, i);
-                print_tree(pager, child, indentation_level + 1, schema);
-
-                indent(indentation_level + 1);
-                printf("- key %d\n", *internal_node_key(node, i));
+            for (uint32_t i = 0; i < indentation_level; i++) {
+                *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "  ");
             }
-            child = *internal_node_right_child(node);
-            print_tree(pager, child, indentation_level + 1, schema);
-        }
-        break;
+            *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "- internal (size %d)\n", num_keys);
+            if (num_keys > 0) {
+                for (uint32_t i = 0; i < num_keys; i++) {
+                    child = *internal_node_child(node, i);
+                    print_tree_to_buffer(pager, child, indentation_level + 1, schema, buffer, buffer_size, buffer_pos);
+
+                    for (uint32_t j = 0; j < indentation_level + 1; j++) {
+                        *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "  ");
+                    }
+                    *buffer_pos += snprintf(buffer + *buffer_pos, buffer_size - *buffer_pos, "- key %d\n", *internal_node_key(node, i));
+                }
+                child = *internal_node_right_child(node);
+                print_tree_to_buffer(pager, child, indentation_level + 1, schema, buffer, buffer_size, buffer_pos);
+            }
+            break;
     }
 }
+
 
 
 Cursor* leaf_node_find(Table* table, uint32_t page_num, uint32_t key) {
@@ -1902,7 +1911,10 @@ void load_database(Database* db, const char* db_file) {
 }
 
 // 处理元命令
-MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db, const char* db_file) {
+MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db, const char* db_file, GtkTextBuffer *output_buffer_widget) {
+    GtkTextIter output_iter;
+    gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
+
     if (strcmp(input_buffer->buffer, ".exit") == 0) {
         save_database(db, db_file);
         exit(EXIT_SUCCESS);
@@ -1913,15 +1925,20 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db, const
         }
         return META_COMMAND_SUCCESS;
     } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
+        char tree_output_buffer[OUTPUT_BUFFER_SIZE];
+        size_t buffer_pos = 0;
         for (int i = 0; i < db->table_count; i++) {
-            printf("Table: %s\n", db->tables[i]->schema.name);
-            print_tree(db->tables[i]->pager, 0, 0, &db->tables[i]->schema);
+            buffer_pos += snprintf(tree_output_buffer + buffer_pos, OUTPUT_BUFFER_SIZE - buffer_pos, "Table: %s\n", db->tables[i]->schema.name);
+            print_tree_to_buffer(db->tables[i]->pager, db->tables[i]->root_page_num, 0, &db->tables[i]->schema, tree_output_buffer, OUTPUT_BUFFER_SIZE, &buffer_pos);
         }
+        tree_output_buffer[buffer_pos] = '\0'; // Null-terminate the buffer
+        gtk_text_buffer_insert(output_buffer_widget, &output_iter, tree_output_buffer, -1);
         return META_COMMAND_SUCCESS;
     } else {
         return META_COMMAND_UNRECOGNIZED_COMMAND;
     }
 }
+
 
 void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     GtkWidget **widgets = (GtkWidget **)data;
@@ -1945,11 +1962,12 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     input_buffer->input_length = strlen(input_text);
 
     GtkTextBuffer *output_buffer_widget = gtk_text_view_get_buffer(GTK_TEXT_VIEW(output_text_view));
-    GtkTextIter output_iter;
-    gtk_text_buffer_get_end_iter(output_buffer_widget, &output_iter);
-    gtk_text_buffer_insert(output_buffer_widget, &output_iter, "db > ", -1);
-    gtk_text_buffer_insert(output_buffer_widget, &output_iter, input_text, -1);
-    gtk_text_buffer_insert(output_buffer_widget, &output_iter, "\n", -1);
+    gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+    gtk_text_buffer_insert(output_buffer_widget, &end, "db > ", -1);
+    gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+    gtk_text_buffer_insert(output_buffer_widget, &end, input_text, -1);
+    gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+    gtk_text_buffer_insert(output_buffer_widget, &end, "\n", -1);
 
     g_free(input_text);
 
@@ -1957,15 +1975,19 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     output_buffer_pos = 0;
 
     if (input_buffer->buffer[0] == '.') {
-        switch (do_meta_command(input_buffer, db, db_file)) {
+        switch (do_meta_command(input_buffer, db, db_file, output_buffer_widget)) {
             case (META_COMMAND_SUCCESS):
-                gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Meta-command executed successfully.\n", -1);
-                gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+                gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+                gtk_text_buffer_insert(output_buffer_widget, &end, "Meta-command executed successfully.\n", -1);
+                gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+                gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
                 gtk_text_buffer_set_text(buffer, "", -1);
                 return;
             case (META_COMMAND_UNRECOGNIZED_COMMAND):
-                gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Unrecognized command.\n", -1);
-                gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+                gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+                gtk_text_buffer_insert(output_buffer_widget, &end, "Unrecognized command.\n", -1);
+                gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+                gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
                 return;
         }
     }
@@ -1975,20 +1997,28 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
         case (PREPARE_SUCCESS):
             break;
         case (PREPARE_NEGATIVE_ID):
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "ID must be positive.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "ID must be positive.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             return;
         case (PREPARE_STRING_TOO_LONG):
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "String is too long.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "String is too long.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             return;
         case (PREPARE_SYNTAX_ERROR):
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Syntax error. Could not parse statement.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "Syntax error. Could not parse statement.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             return;
         case (PREPARE_UNRECOGNIZED_STATEMENT):
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Unrecognized keyword.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "Unrecognized keyword.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             return;
     }
 
@@ -2081,24 +2111,34 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     }
     switch (result) {
         case EXECUTE_SUCCESS:
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Executed.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "Executed.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             gtk_text_buffer_set_text(buffer, "", -1);
             break;
         case EXECUTE_TABLE_FULL:
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Table full.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "Error: Table full.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             break;
         case EXECUTE_DUPLICATE_KEY:
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Duplicate key.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "Error: Duplicate key.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             break;
         case EXECUTE_TABLE_NOT_FOUND:
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Error: Table not found.\n", -1);
-            gtk_text_buffer_insert(output_buffer_widget, &output_iter, output_buffer, -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, "Error: Table not found.\n", -1);
+            gtk_text_buffer_get_end_iter(output_buffer_widget, &end); // Re-get the iter here
+            gtk_text_buffer_insert(output_buffer_widget, &end, output_buffer, -1);
             break;
     }
 }
+
+
 
 
 int main(int argc, char *argv[]) {
