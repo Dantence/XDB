@@ -1039,13 +1039,11 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement, Da
         return PREPARE_SYNTAX_ERROR;
     }
 
-    // Extract and parse column list
     size_t column_list_length = column_list_end - column_list_start - 1;
     char* column_list = (char*)malloc(column_list_length + 1);
     strncpy(column_list, column_list_start + 1, column_list_length);
     column_list[column_list_length] = '\0';
 
-    // Extract and parse value list
     char* value_list_start = strstr(values_keyword, "(");
     char* value_list_end = strstr(values_keyword, ")");
     if (value_list_start == NULL || value_list_end == NULL) {
@@ -1059,15 +1057,12 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement, Da
     strncpy(value_list, value_list_start + 1, value_list_length);
     value_list[value_list_length] = '\0';
 
-    // Parse columns
     char* column = strtok(column_list, ",");
     int column_indices[TABLE_MAX_COLS];
     int column_count = 0;
 
     while (column != NULL) {
-        // Trim leading whitespace
         while (*column == ' ') column++;
-        // Validate and store column index
         bool found = false;
         for (int i = 0; i < table->schema.num_columns; i++) {
             if (strcmp(column, table->schema.columns[i].name) == 0) {
@@ -1080,23 +1075,19 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement, Da
             free(buffer);
             free(column_list);
             free(value_list);
-            return PREPARE_SYNTAX_ERROR;  // Invalid column name
+            return PREPARE_SYNTAX_ERROR;
         }
         column = strtok(NULL, ",");
     }
 
-    // Initialize all columns to NULL or default values
     for (int i = 0; i < table->schema.num_columns; i++) {
         statement->row_to_insert.columns[i] = NULL;
     }
 
-    // Parse values
     char* value = strtok(value_list, ",");
     int value_index = 0;
     while (value != NULL && value_index < column_count) {
-        // Trim leading whitespace
         while (*value == ' ') value++;
-        // Convert and store value
         int col_index = column_indices[value_index];
         if (table->schema.columns[col_index].type == COLUMN_TYPE_INT) {
             if (col_index == 0) {
@@ -1137,6 +1128,7 @@ PrepareResult prepare_insert(InputBuffer* input_buffer, Statement* statement, Da
     return PREPARE_SUCCESS;
 }
 
+
 PrepareResult prepare_select(InputBuffer* input_buffer, Statement* statement, Database* db) {
     statement->type = STATEMENT_SELECT;
     char* buffer = strdup(input_buffer->buffer);
@@ -1150,7 +1142,6 @@ PrepareResult prepare_select(InputBuffer* input_buffer, Statement* statement, Da
         return PREPARE_SYNTAX_ERROR;
     }
 
-    // Extract columns part and table name part
     size_t columns_length = from_pos - remaining_str;
     char* columns_str = (char*)malloc(columns_length + 1);
     strncpy(columns_str, remaining_str, columns_length);
@@ -1163,13 +1154,12 @@ PrepareResult prepare_select(InputBuffer* input_buffer, Statement* statement, Da
         return PREPARE_SYNTAX_ERROR;
     }
 
-    // Find the position of "WHERE"
     char* where_pos = strstr(table_name, " where ");
     if (where_pos != NULL) {
         *where_pos = '\0'; // Null-terminate table name
         where_pos += strlen(" where ");
         // Parse WHERE condition
-        char* condition_column = strtok(where_pos, " ");
+        char* condition_column = strtok(where_pos, " =<>");
         char* condition_operator = strtok(NULL, " ");
         char* condition_value = strtok(NULL, " ");
 
@@ -1205,7 +1195,6 @@ PrepareResult prepare_select(InputBuffer* input_buffer, Statement* statement, Da
     return PREPARE_SUCCESS;
 }
 
-
 PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Database* db) {
     statement->type = STATEMENT_UPDATE;
     char* buffer = strdup(input_buffer->buffer);
@@ -1224,16 +1213,21 @@ PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Da
     }
 
     char* set_clause = strtok(NULL, ";");
-    if (set_clause == NULL) {
-        free(buffer);
-        return PREPARE_SYNTAX_ERROR;
+    char* where_clause = NULL;
+
+    // 检查是否有WHERE子句
+    if (set_clause) {
+        char* where_ptr = strstr(set_clause, " where ");
+        if (where_ptr) {
+            *where_ptr = '\0'; // 终止set子句
+            where_clause = where_ptr + 7; // 移动到where子句的开始
+        }
     }
 
     // 解析 set 子句
     char* column_value_pair = strtok(set_clause, ",");
     int column_count = 0;
     while (column_value_pair != NULL && column_count < TABLE_MAX_COLS) {
-        // 去除等号两侧的空格
         while (*column_value_pair == ' ') column_value_pair++;
         char* equal_sign = strchr(column_value_pair, '=');
         if (equal_sign == NULL) {
@@ -1245,18 +1239,15 @@ PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Da
         char* column_name = column_value_pair;
         char* value = equal_sign + 1;
 
-        // 去除列名后面的空格
         char* col_end = column_name + strlen(column_name) - 1;
         while (col_end > column_name && *col_end == ' ') col_end--;
         *(col_end + 1) = '\0';
 
-        // 去除值两侧的空格
         while (*value == ' ') value++;
         char* end = value + strlen(value) - 1;
         while (end > value && *end == ' ') end--;
         *(end + 1) = '\0';
 
-        // 查找列索引
         Table* table = find_table(db, table_name);
         if (!table) {
             free(buffer);
@@ -1299,9 +1290,30 @@ PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Da
     }
     statement->num_columns = column_count;
 
+    // 解析 WHERE 子句
+    if (where_clause != NULL) {
+        char* condition_column = strtok(where_clause, " =<>");
+        char* condition_operator = strtok(NULL, " ");
+        char* condition_value = strtok(NULL, " ");
+
+        if (condition_column == NULL || condition_operator == NULL || condition_value == NULL) {
+            free(buffer);
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        strcpy(statement->condition_column, condition_column);
+        strcpy(statement->condition_operator, condition_operator);
+        strcpy(statement->condition_value, condition_value);
+        statement->has_condition = true;
+    } else {
+        statement->has_condition = false;
+    }
+
     free(buffer);
     return PREPARE_SUCCESS;
 }
+
+
 
 PrepareResult prepare_delete(InputBuffer* input_buffer, Statement* statement, Database* db) {
     statement->type = STATEMENT_DELETE;
@@ -1347,17 +1359,18 @@ PrepareResult prepare_delete(InputBuffer* input_buffer, Statement* statement, Da
 PrepareResult prepare_create_table(InputBuffer* input_buffer, Statement* statement) {
     statement->type = STATEMENT_CREATE_TABLE;
 
-    char* buffer = strdup(input_buffer->buffer); // 复制缓冲区以避免修改原始输入
-
+    char* buffer = strdup(input_buffer->buffer);
     // 提取表名
     char* keyword = strtok(buffer, " "); // create
     keyword = strtok(NULL, " "); // table
-    char* table_name = strtok(NULL, " ("); // table name
+    char* table_name = strtok(NULL, "("); // 获取表名，直到'('为止
 
     if (table_name == NULL) {
         free(buffer);
         return PREPARE_SYNTAX_ERROR;
     }
+
+    while (*table_name == ' ') table_name++; // 去掉前导空格
 
     strcpy(statement->table_name, table_name);
 
@@ -1376,18 +1389,18 @@ PrepareResult prepare_create_table(InputBuffer* input_buffer, Statement* stateme
         free(buffer);
         return PREPARE_SYNTAX_ERROR;
     }
+
     char *cols[TABLE_MAX_COLS];
 
-    // 分割列定义并解析每个列
-    for(char *str = strtok(columns_def, ","); str != NULL; str = strtok(NULL, ",")) {
+    for (char *str = strtok(columns_def, ","); str != NULL; str = strtok(NULL, ",")) {
         cols[statement->num_columns] = str;
         statement->num_columns++;
     }
-    for(int i = 0; i < statement->num_columns; i++) {
+    for (int i = 0; i < statement->num_columns; i++) {
         char* column_name = strtok(cols[i], " ");
-        while(*column_name == ' ') column_name++;
-        char*column_type_str = strtok(NULL, " ");
-        while(*column_type_str == ' ') column_type_str++;
+        while (*column_name == ' ') column_name++;
+        char* column_type_str = strtok(NULL, " ");
+        while (*column_type_str == ' ') column_type_str++;
         if (strcmp(column_type_str, "int") == 0) {
             statement->columns[i].type = COLUMN_TYPE_INT;
         } else if (strcmp(column_type_str, "double") == 0) {
@@ -1399,12 +1412,12 @@ PrepareResult prepare_create_table(InputBuffer* input_buffer, Statement* stateme
             return PREPARE_SYNTAX_ERROR;
         }
         strncpy(statement->columns[i].name, column_name, 32);
-
     }
 
     free(buffer);
     return PREPARE_SUCCESS;
 }
+
 
 PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement, Database* db) {
     // 确保所有非元命令以分号结束
