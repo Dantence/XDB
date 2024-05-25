@@ -10,7 +10,7 @@
 #include <pango/pango.h>
 #include <string.h>
 #include <errno.h>
-
+#include "db.h"
 #define MAX_TABLE_NAME_LENGTH 64
 #define TABLE_MAX_PAGES 100
 #define TABLE_MAX_COLS 10
@@ -26,42 +26,6 @@ void append_to_output_buffer(const char *format, ...) {
     output_buffer_pos += vsnprintf(output_buffer + output_buffer_pos, OUTPUT_BUFFER_SIZE - output_buffer_pos, format, args);
     va_end(args);
 }
-
-typedef enum {
-    COLUMN_TYPE_INT,
-    COLUMN_TYPE_DOUBLE,
-    COLUMN_TYPE_TEXT
-} ColumnType;
-
-typedef struct {
-    char name[32];
-    ColumnType type;
-} Column;
-
-typedef struct {
-    char name[32];
-    int num_columns;
-    Column columns[10]; // 假设最多支持10列
-    uint32_t row_size; // 行大小
-    uint32_t leaf_node_cell_size; // 叶节点单元大小
-    uint32_t leaf_node_space_for_cells; // 叶节点单元空间
-    uint32_t leaf_node_max_cells; // 叶节点最大单元数
-    uint32_t leaf_node_left_split_count; // 左分裂单元数
-} TableSchema;
-
-// 行属性
-typedef struct {
-    uint32_t id;
-    char* columns[10]; // 动态列值，最多支持10列
-} Row;
-
-#define INPUT_BUFFER_SIZE 1024
-// 输入信息
-typedef struct {
-    char* buffer;
-    size_t buffer_length;
-    ssize_t input_length;
-} InputBuffer;
 
 // 创建输入信息
 InputBuffer* new_input_buffer() {
@@ -123,84 +87,6 @@ void close_input_buffer(InputBuffer* input_buffer) {
     free(input_buffer->buffer);
     free(input_buffer);
 }
-
-
-// 执行结果
-typedef enum {
-    EXECUTE_SUCCESS,
-    EXECUTE_TABLE_FULL,
-    EXECUTE_DUPLICATE_KEY,
-    EXECUTE_TABLE_NOT_FOUND,
-    EXECUTE_FAILURE
-} ExecuteResult;
-
-// 元命令，以.开头
-typedef enum {
-    META_COMMAND_SUCCESS,
-    META_COMMAND_UNRECOGNIZED_COMMAND
-} MetaCommandResult;
-
-// SQL语句
-typedef enum {
-    PREPARE_SUCCESS,
-    PREPARE_SYNTAX_ERROR,
-    PREPARE_STRING_TOO_LONG,
-    PREPARE_UNRECOGNIZED_STATEMENT,
-    PREPARE_NEGATIVE_ID,
-    PREPARE_TABLE_NOT_FOUND
-} PrepareResult;
-
-typedef struct {
-    int file_descriptor;
-    uint32_t file_length;
-    uint32_t num_pages;
-    void* pages[TABLE_MAX_PAGES];
-} Pager;
-
-typedef struct {
-    uint32_t root_page_num;
-    Pager* pager;
-    TableSchema schema; // 新增：表架构
-} Table;
-
-
-typedef struct {
-    Table* tables[100]; // 最多支持100张表
-    int table_count;
-} Database;
-
-// 游标抽象
-typedef struct {
-    Table* table;
-    uint32_t page_num;
-    uint32_t cell_num;
-    bool end_of_table; // 标识表末尾
-} Cursor;
-
-// SQL语句类型
-typedef enum {
-    STATEMENT_INSERT,
-    STATEMENT_SELECT,
-    STATEMENT_UPDATE,
-    STATEMENT_DELETE,
-    STATEMENT_CREATE_TABLE,
-    STATEMENT_DROP_TABLE,
-    STATEMENT_SHOW_TABLES,
-    STATEMENT_DESC_TABLE
-} StatementType;
-
-// SQL语句
-typedef struct {
-    StatementType type;
-    char table_name[32];
-    int num_columns;          // 列数
-    Column columns[TABLE_MAX_COLS];       // 列信息
-    Row row_to_insert;        // 仅用于插入语句
-    char condition_column[32];
-    char condition_operator[3];
-    char condition_value[32];
-    bool has_condition;
-} Statement;
 
 // 打印行
 void print_row(Row* row, TableSchema* schema) {
@@ -1582,7 +1468,12 @@ void free_table(Table* table) {
 void drop_table(Database* db, const char* table_name) {
     for (int i = 0; i < db->table_count; i++) {
         if (strcmp(db->tables[i]->schema.name, table_name) == 0) {
+            char db_filename[64];
+            snprintf(db_filename, sizeof(db_filename), "%s.db", table_name);
             free_table(db->tables[i]);
+            remove(db_filename);
+
+            // 调整表数组
             for (int j = i; j < db->table_count - 1; j++) {
                 db->tables[j] = db->tables[j + 1];
             }
@@ -1592,6 +1483,7 @@ void drop_table(Database* db, const char* table_name) {
         }
     }
 }
+
 
 
 
@@ -1842,10 +1734,14 @@ ExecuteResult execute_delete(Statement* statement, Database* db) {
             (*leaf_node_num_cells(node)) -= 1;
 
             // 更新B树
-            if (cursor->page_num != table->root_page_num) {
-                uint32_t new_max = get_node_max_key(table->pager, node, &table->schema);
-                void* parent = get_page(table->pager, *node_parent(node));
-                update_internal_node_key(parent, target_id, new_max);
+            if (*leaf_node_num_cells(node) > 0) {  // 只有在节点非空时更新B树
+                if (cursor->page_num != table->root_page_num) {
+                    uint32_t new_max = get_node_max_key(table->pager, node, &table->schema);
+                    void* parent = get_page(table->pager, *node_parent(node));
+                    update_internal_node_key(parent, target_id, new_max);
+                }
+            } else {
+                printf("Leaf node is now empty, no max key update needed.\n");
             }
 
             break;
@@ -1976,13 +1872,17 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db, const
             print_constants(&db->tables[i]->schema);
         }
         return META_COMMAND_SUCCESS;
-    } else if (strcmp(input_buffer->buffer, ".btree") == 0) {
+    } else if (strncmp(input_buffer->buffer, ".btree ", 7) == 0) {
+        char* table_name = input_buffer->buffer + 7; // 获取表名
+        Table* table = find_table(db, table_name);
+        if (table == NULL) {
+            gtk_text_buffer_insert(output_buffer_widget, &output_iter, "Table not found.\n", -1);
+            return META_COMMAND_UNRECOGNIZED_COMMAND;
+        }
         char tree_output_buffer[OUTPUT_BUFFER_SIZE];
         size_t buffer_pos = 0;
-        for (int i = 0; i < db->table_count; i++) {
-            buffer_pos += snprintf(tree_output_buffer + buffer_pos, OUTPUT_BUFFER_SIZE - buffer_pos, "Table: %s\n", db->tables[i]->schema.name);
-            print_tree_to_buffer(db->tables[i]->pager, db->tables[i]->root_page_num, 0, &db->tables[i]->schema, tree_output_buffer, OUTPUT_BUFFER_SIZE, &buffer_pos);
-        }
+        buffer_pos += snprintf(tree_output_buffer + buffer_pos, OUTPUT_BUFFER_SIZE - buffer_pos, "Table: %s\n", table->schema.name);
+        print_tree_to_buffer(table->pager, table->root_page_num, 0, &table->schema, tree_output_buffer, OUTPUT_BUFFER_SIZE, &buffer_pos);
         tree_output_buffer[buffer_pos] = '\0'; // Null-terminate the buffer
         gtk_text_buffer_insert(output_buffer_widget, &output_iter, tree_output_buffer, -1);
         return META_COMMAND_SUCCESS;
@@ -1990,7 +1890,6 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Database* db, const
         return META_COMMAND_UNRECOGNIZED_COMMAND;
     }
 }
-
 
 void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     GtkWidget **widgets = (GtkWidget **)data;
@@ -2190,9 +2089,6 @@ void on_execute_button_clicked(GtkWidget *widget, gpointer data) {
     }
 }
 
-
-
-
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Must supply a database filename.\n");
@@ -2219,6 +2115,7 @@ int main(int argc, char *argv[]) {
     GtkTreeViewColumn *col;
     GtkCellRenderer *renderer;
     GtkWidget *scroll_result_window;
+    GtkWidget *paned;
 
     gtk_init(&argc, &argv);
 
@@ -2242,10 +2139,14 @@ int main(int argc, char *argv[]) {
     execute_button = gtk_button_new_with_label("Execute SQL");
     gtk_box_pack_start(GTK_BOX(vbox), execute_button, FALSE, FALSE, 0);
 
+    // 添加一个paned容器，用于输出框和结果视图
+    paned = gtk_paned_new(GTK_ORIENTATION_VERTICAL);
+    gtk_box_pack_start(GTK_BOX(vbox), paned, TRUE, TRUE, 0);
+
     // 添加一个滚动窗口容器，用于输出框
     output_scroll_window = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(output_scroll_window), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_box_pack_start(GTK_BOX(vbox), output_scroll_window, TRUE, TRUE, 0);
+    gtk_paned_pack1(GTK_PANED(paned), output_scroll_window, TRUE, TRUE);
 
     output_text_view = gtk_text_view_new();
     gtk_text_view_set_editable(GTK_TEXT_VIEW(output_text_view), FALSE); // 使其不可编辑
@@ -2254,7 +2155,7 @@ int main(int argc, char *argv[]) {
     // 定义result_view
     scroll_result_window = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroll_result_window), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
-    gtk_box_pack_start(GTK_BOX(vbox), scroll_result_window, TRUE, TRUE, 0);
+    gtk_paned_pack2(GTK_PANED(paned), scroll_result_window, TRUE, TRUE);
 
     result_store = gtk_list_store_new(1, G_TYPE_STRING); // 最初设置为 1 列，稍后会根据查询结果动态更新列数
     result_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(result_store));
