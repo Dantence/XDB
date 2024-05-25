@@ -1223,17 +1223,21 @@ PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Da
         return PREPARE_SYNTAX_ERROR;
     }
 
-    char* set_clause = strtok(NULL, ";");
-    if (set_clause == NULL) {
-        free(buffer);
-        return PREPARE_SYNTAX_ERROR;
+    // Find where clause if it exists
+    char* where_clause_pos = strstr(input_buffer->buffer, " where ");
+    char* set_clause;
+    if (where_clause_pos != NULL) {
+        *where_clause_pos = '\0'; // Null-terminate the SET clause
+        set_clause = set_keyword + 4; // Skip "set "
+        where_clause_pos += 7; // Move past " where "
+    } else {
+        set_clause = set_keyword + 4; // Skip "set "
     }
 
-    // 解析 set 子句
+    // Parse set clause
     char* column_value_pair = strtok(set_clause, ",");
     int column_count = 0;
     while (column_value_pair != NULL && column_count < TABLE_MAX_COLS) {
-        // 去除等号两侧的空格
         while (*column_value_pair == ' ') column_value_pair++;
         char* equal_sign = strchr(column_value_pair, '=');
         if (equal_sign == NULL) {
@@ -1245,18 +1249,18 @@ PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Da
         char* column_name = column_value_pair;
         char* value = equal_sign + 1;
 
-        // 去除列名后面的空格
+        // Trim trailing spaces from column_name
         char* col_end = column_name + strlen(column_name) - 1;
         while (col_end > column_name && *col_end == ' ') col_end--;
         *(col_end + 1) = '\0';
 
-        // 去除值两侧的空格
+        // Trim leading and trailing spaces from value
         while (*value == ' ') value++;
         char* end = value + strlen(value) - 1;
         while (end > value && *end == ' ') end--;
         *(end + 1) = '\0';
 
-        // 查找列索引
+        // Find column index
         Table* table = find_table(db, table_name);
         if (!table) {
             free(buffer);
@@ -1299,9 +1303,27 @@ PrepareResult prepare_update(InputBuffer* input_buffer, Statement* statement, Da
     }
     statement->num_columns = column_count;
 
+    if (where_clause_pos != NULL) {
+        char* condition_column = strtok(where_clause_pos, " ");
+        char* condition_operator = strtok(NULL, " ");
+        char* condition_value = strtok(NULL, " ");
+        if (condition_column == NULL || condition_operator == NULL || condition_value == NULL) {
+            free(buffer);
+            return PREPARE_SYNTAX_ERROR;
+        }
+
+        strcpy(statement->condition_column, condition_column);
+        strcpy(statement->condition_operator, condition_operator);
+        strcpy(statement->condition_value, condition_value);
+        statement->has_condition = true;
+    } else {
+        statement->has_condition = false;
+    }
+
     free(buffer);
     return PREPARE_SUCCESS;
 }
+
 
 PrepareResult prepare_delete(InputBuffer* input_buffer, Statement* statement, Database* db) {
     statement->type = STATEMENT_DELETE;
@@ -1481,13 +1503,14 @@ Pager* pager_open(const char* filename) {
     // 获取文件长度
     off_t file_length = _lseek(fd, 0, SEEK_END);
 
-    Pager* pager = malloc(sizeof(Pager));
+    Pager* pager = (Pager*)malloc(sizeof(Pager));
     pager->file_descriptor = fd;
     pager->file_length = file_length;
     pager->num_pages = (file_length / PAGE_SIZE);
+
+    // 检查文件长度是否是页面大小的倍数，并处理剩余部分
     if (file_length % PAGE_SIZE != 0) {
-        printf("Db file is not a whole number of pages. Corrupt file.\n");
-        exit(EXIT_FAILURE);
+        pager->num_pages += 1;  // 增加页数以包括部分页
     }
 
     for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
@@ -1718,44 +1741,73 @@ ExecuteResult execute_update(Statement* statement, Database* db) {
         return EXECUTE_TABLE_NOT_FOUND;
     }
 
-    void* node = get_page(table->pager, table->root_page_num);
-    uint32_t num_cells = (*leaf_node_num_cells(node));
     Cursor* cursor = table_start(table);
     Row row;
 
-    // 遍历所有行并更新匹配的行
     while (!(cursor->end_of_table)) {
         deserialize_row(cursor_value(cursor), &row, &table->schema);
 
-        // 检查是否满足更新条件 (假设我们有一个简单的条件检查机制)
-        // if (row_meets_condition(row)) {
-        // 解析并应用set子句的值
-        for (int i = 0; i < statement->num_columns; i++) {
-            int column_index = -1;
-            for (int j = 0; j < table->schema.num_columns; j++) {
-                if (strcmp(statement->columns[i].name, table->schema.columns[j].name) == 0) {
-                    column_index = j;
-                    break;
+        bool condition_met = true;
+        if (statement->has_condition) {
+            condition_met = false; // Assume condition not met unless proven otherwise
+            for (int i = 0; i < table->schema.num_columns; i++) {
+                if (strcmp(statement->condition_column, table->schema.columns[i].name) == 0) {
+                    if (table->schema.columns[i].type == COLUMN_TYPE_INT) {
+                        int column_value = *((int*)row.columns[i]);
+                        int condition_value = atoi(statement->condition_value);
+                        if (strcmp(statement->condition_operator, "=") == 0 && column_value == condition_value) {
+                            condition_met = true;
+                        } else if (strcmp(statement->condition_operator, "<") == 0 && column_value < condition_value) {
+                            condition_met = true;
+                        } else if (strcmp(statement->condition_operator, ">") == 0 && column_value > condition_value) {
+                            condition_met = true;
+                        }
+                    } else if (table->schema.columns[i].type == COLUMN_TYPE_DOUBLE) {
+                        double column_value = *((double*)row.columns[i]);
+                        double condition_value = atof(statement->condition_value);
+                        if (strcmp(statement->condition_operator, "=") == 0 && column_value == condition_value) {
+                            condition_met = true;
+                        } else if (strcmp(statement->condition_operator, "<") == 0 && column_value < condition_value) {
+                            condition_met = true;
+                        } else if (strcmp(statement->condition_operator, ">") == 0 && column_value > condition_value) {
+                            condition_met = true;
+                        }
+                    } else if (table->schema.columns[i].type == COLUMN_TYPE_TEXT) {
+                        if (strcmp(statement->condition_operator, "=") == 0 && strcmp(row.columns[i], statement->condition_value) == 0) {
+                            condition_met = true;
+                        }
+                    }
                 }
             }
-            if (column_index == -1) {
-                continue;
-            }
-            switch (table->schema.columns[column_index].type) {
-                case COLUMN_TYPE_INT:
-                    *((int*)row.columns[column_index]) = *((int*)statement->row_to_insert.columns[i]);
-                break;
-                case COLUMN_TYPE_DOUBLE:
-                    *((double*)row.columns[column_index]) = *((double*)statement->row_to_insert.columns[i]);
-                break;
-                case COLUMN_TYPE_TEXT:
-                    free(row.columns[column_index]);
-                row.columns[column_index] = strdup(statement->row_to_insert.columns[i]);
-                break;
-            }
         }
-        serialize_row(&row, cursor_value(cursor), &table->schema);
-        // }
+
+        if (condition_met) {
+            for (int i = 0; i < statement->num_columns; i++) {
+                int column_index = -1;
+                for (int j = 0; j < table->schema.num_columns; j++) {
+                    if (strcmp(statement->columns[i].name, table->schema.columns[j].name) == 0) {
+                        column_index = j;
+                        break;
+                    }
+                }
+                if (column_index == -1) {
+                    continue;
+                }
+                switch (table->schema.columns[column_index].type) {
+                    case COLUMN_TYPE_INT:
+                        *((int*)row.columns[column_index]) = *((int*)statement->row_to_insert.columns[i]);
+                        break;
+                    case COLUMN_TYPE_DOUBLE:
+                        *((double*)row.columns[column_index]) = *((double*)statement->row_to_insert.columns[i]);
+                        break;
+                    case COLUMN_TYPE_TEXT:
+                        free(row.columns[column_index]);
+                        row.columns[column_index] = strdup(statement->row_to_insert.columns[i]);
+                        break;
+                }
+            }
+            serialize_row(&row, cursor_value(cursor), &table->schema);
+        }
 
         cursor_advance(cursor);
     }
@@ -2208,7 +2260,7 @@ int main(int argc, char *argv[]) {
     result_view = gtk_tree_view_new_with_model(GTK_TREE_MODEL(result_store));
     gtk_container_add(GTK_CONTAINER(scroll_result_window), result_view);
     renderer = gtk_cell_renderer_text_new();
-    col = gtk_tree_view_column_new_with_attributes("Column 1", renderer, "text", 0, NULL);
+    col = gtk_tree_view_column_new_with_attributes("视图", renderer, "text", 0, NULL);
     gtk_tree_view_append_column(GTK_TREE_VIEW(result_view), col);
 
     // 设置字体
